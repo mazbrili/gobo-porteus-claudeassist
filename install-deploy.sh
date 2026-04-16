@@ -96,12 +96,20 @@ make_iso() {
         [ -f "$candidate" ] && isolinux_bin="$candidate" && break
     done
 
-    # Salin isolinux.bin ke output jika belum ada
-    if [ -n "$isolinux_bin" ]; then
-        cp "$isolinux_bin" "$OUTPUT_DIR/boot/syslinux/"
-        # Rename porteus.cfg -> isolinux.cfg untuk ISO boot
-        cp "$OUTPUT_DIR/boot/syslinux/porteus.cfg" \
-           "$OUTPUT_DIR/boot/syslinux/isolinux.cfg" 2>/dev/null || true
+if [ -n "$isolinux_bin" ] && [ -f "$isolinux_bin" ]; then
+        DEST_DIR="$OUTPUT_DIR/boot/syslinux"
+        mkdir -p "$DEST_DIR"
+
+        # Cek apakah file sumber berada di luar direktori tujuan
+        # agar tidak terjadi "same file error"
+        if [ "$(realpath "$isolinux_bin")" != "$(realpath "$DEST_DIR/isolinux.bin")" ]; then
+            cp "$isolinux_bin" "$DEST_DIR/"
+        fi
+
+        # Rename porteus.cfg -> isolinux.cfg
+        if [ -f "$DEST_DIR/porteus.cfg" ]; then
+            cp "$DEST_DIR/porteus.cfg" "$DEST_DIR/isolinux.cfg"
+        fi
     fi
 
     xorriso -as mkisofs \
