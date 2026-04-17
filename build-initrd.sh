@@ -147,9 +147,9 @@ extract_busybox_from_slax() {
     cd - >/dev/null
 
     info "Isi initramfs Slax:"
-    find "$slax_initrd_dir" -not -type d | head -20 | while read -r f; do
-        echo "    ${f#$slax_initrd_dir/}"
-    done
+    while read -r f; do
+    echo "    ${f#$slax_initrd_dir/}"
+    done < <(find "$slax_initrd_dir" -not -type d | head -20)
 
     # Cari binary busybox
     local bb=""
@@ -226,9 +226,9 @@ extract_gobo016_initrd_structure() {
     if mount -t cramfs -o loop,ro "$initrd016" "$cramfs_mnt" 2>/dev/null; then
         info "CramFS ter-mount di $cramfs_mnt"
         info "Isi GoboLinux 016 initrd:"
-        find "$cramfs_mnt" -not -type d | sort | head -40 | while read -r f; do
-            echo "    ${f#$cramfs_mnt/}"
-        done
+	    while read -r f; do
+             echo "    ${f#$cramfs_mnt/}"
+			    done < <(find "$cramfs_mnt" -not -type d | head -40)
 
         # Salin semua isi initrd 016 ke referensi
         cp -a "$cramfs_mnt/." "$WORK/gobo016-initrd/" 2>/dev/null || true
