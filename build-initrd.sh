@@ -147,12 +147,9 @@ extract_busybox_from_slax() {
     cd - >/dev/null
 
     info "Isi initramfs Slax:"
-    #find "$slax_initrd_dir" -not -type d | head -20 | while read -r f; do
-    #    echo "    ${f#$slax_initrd_dir/}"
-    #done
-    while read -r f; do
-    echo "    ${f#$slax_initrd_dir/}"
-    done < <(find "$slax_initrd_dir" -not -type d | head -20)
+    find "$slax_initrd_dir" -not -type d | head -20 | while read -r f; do
+        echo "    ${f#$slax_initrd_dir/}"
+    done
 
     # Cari binary busybox
     local bb=""
@@ -229,12 +226,9 @@ extract_gobo016_initrd_structure() {
     if mount -t cramfs -o loop,ro "$initrd016" "$cramfs_mnt" 2>/dev/null; then
         info "CramFS ter-mount di $cramfs_mnt"
         info "Isi GoboLinux 016 initrd:"
-        #find "$cramfs_mnt" -not -type d | sort | head -40 | while read -r f; do
-        #    echo "    ${f#$cramfs_mnt/}"
-        #done
-        while read -r f; do
+        find "$cramfs_mnt" -not -type d | sort | head -40 | while read -r f; do
             echo "    ${f#$cramfs_mnt/}"
-        done < <(find "$cramfs_mnt" -not -type d | head -20)
+        done
 
         # Salin semua isi initrd 016 ke referensi
         cp -a "$cramfs_mnt/." "$WORK/gobo016-initrd/" 2>/dev/null || true
@@ -421,18 +415,49 @@ mount -t tmpfs    tmpfs  /run
 
 print_status "Kernel $(uname -r)"
 
-# ── 2. mdev (GoboLinux 016 juga pakai ini untuk populate /dev) ───────────────
-print_status "Menjalankan mdev..."
-echo /bin/mdev > /proc/sys/kernel/hotplug 2>/dev/null || true
+# ── 2. Load modul kernel dulu, BARU populate /dev ───────────────────────────
+# Urutan ini penting untuk Hyper-V: hv_storvsc harus load sebelum
+# disk SCSI muncul di /dev, dan squashfs/overlay/loop wajib ada
+# sebelum mount .xzm dilakukan.
+print_status "Load kernel modules..."
+for mod in squashfs overlay loop \
+           hv_vmbus hv_storvsc hv_netvsc hv_utils \
+           virtio virtio_pci virtio_blk virtio_net \
+           sd_mod sr_mod iso9660 vfat exfat; do
+    modprobe "$mod" 2>/dev/null || true
+done
+
+# Setelah modul load, jalankan mdev agar device nodes muncul
+# /proc/sys/kernel/hotplug tidak tersedia di kernel GoboLinux 017
+# (CONFIG_UEVENT_HELPER sudah deprecated), jadi langsung mdev -s
 mdev -s 2>/dev/null || true
 
+# Hyper-V SCSI butuh waktu ~1-2 detik setelah hv_storvsc load
+# sebelum /dev/sda muncul — tunggu dengan polling
+wait_for_devices() {
+    local waited=0
+    local max_wait=10
+    while [ $waited -lt $max_wait ]; do
+        # Cek apakah ada minimal satu block device
+        for dev in /dev/sr? /dev/sd? /dev/vd? /dev/hd? /dev/mmcblk?; do
+            [ -b "$dev" ] && return 0
+        done
+        sleep 1
+        mdev -s 2>/dev/null || true
+        waited=$((waited + 1))
+        print_status "  Menunggu device... ($waited/${max_wait}s)"
+    done
+    return 1
+}
+wait_for_devices || warn "Timeout menunggu block devices"
+
+# Debug: tampilkan semua block device yang terdeteksi
+print_status "Block devices:"
+for dev in /dev/sr? /dev/sd?? /dev/sd? /dev/vd? /dev/mmcblk?p? /dev/mmcblk? /dev/hd?; do
+    [ -b "$dev" ] && echo "  found: $dev $(blkid "$dev" 2>/dev/null | grep -o 'TYPE="[^"]*"' || true)"
+done
+
 # ── 3. Parse cmdline ──────────────────────────────────────────────────────────
-# Mengikuti konvensi Porteus:
-#   from=PATH      — direktori porteus di media
-#   changes=PATH   — direktori untuk perubahan persistent
-#   copy2ram       — salin semua modul ke RAM sebelum boot
-#   nomagic        — boot fresh, tanpa menyimpan perubahan
-#   load=nama.xzm  — muat modul optional tambahan
 FROM_PATH=""
 CHANGES_PATH=""
 COPY2RAM=0
@@ -450,7 +475,6 @@ for p in $(cat /proc/cmdline); do
 done
 
 # ── 4. Probe media — cari /porteus/base/*.xzm ────────────────────────────────
-# GoboLinux 016 startGoboLinux juga melakukan scan partisi seperti ini
 print_status "Mencari media boot..."
 
 PORTEUS_DIR=""
@@ -462,35 +486,58 @@ try_mount_and_find() {
     mount -t "$fs" -o ro "$dev" "$mnt" 2>/dev/null || return 1
     if [ -d "$mnt/porteus/base" ] && \
        ls "$mnt/porteus/base/"*.xzm >/dev/null 2>&1; then
+        print_status "  -> $dev ($fs): OK"
         return 0
     fi
     umount "$mnt" 2>/dev/null || true
     return 1
 }
 
-if [ -n "$FROM_PATH" ] && [ -d "$FROM_PATH/porteus/base" ]; then
-    PORTEUS_DIR="$FROM_PATH/porteus"
-    print_status "  Dari cmdline: $PORTEUS_DIR"
-else
-    SCAN_MNT="/mnt/media/scan"
+scan_media() {
+    local SCAN_MNT="/mnt/media/scan"
     mkdir -p "$SCAN_MNT"
-
-    for dev in /dev/sr? /dev/sd?? /dev/sd? /dev/vd? \
-               /dev/mmcblk?p? /dev/mmcblk? /dev/hd?; do
+    # Optical drive duluan (ISO boot), lalu disk
+    for dev in /dev/sr? /dev/sr?? \
+               /dev/sd? /dev/sd?? \
+               /dev/vd? /dev/hd? \
+               /dev/mmcblk?p? /dev/mmcblk?; do
         [ -b "$dev" ] || continue
-        for fs in iso9660 udf vfat exfat ext4 ext3 ext2 ntfs; do
+        print_status "  Coba: $dev"
+        for fs in iso9660 udf vfat exfat ext4 ext3 ext2; do
             if try_mount_and_find "$dev" "$fs" "$SCAN_MNT"; then
                 PORTEUS_DIR="$SCAN_MNT/porteus"
                 MEDIA_MNT="$SCAN_MNT"
-                print_status "  Ditemukan di $dev ($fs): $PORTEUS_DIR"
-                break 2
+                return 0
             fi
         done
+        # Coba partisi di dalam disk ini
+        for part in "${dev}1" "${dev}2" "${dev}p1" "${dev}p2"; do
+            [ -b "$part" ] || continue
+            for fs in vfat exfat ext4 ext3 ext2 iso9660; do
+                if try_mount_and_find "$part" "$fs" "$SCAN_MNT"; then
+                    PORTEUS_DIR="$SCAN_MNT/porteus"
+                    MEDIA_MNT="$SCAN_MNT"
+                    return 0
+                fi
+            done
+        done
     done
+    return 1
+}
+
+if [ -n "$FROM_PATH" ] && [ -d "$FROM_PATH/porteus/base" ]; then
+    PORTEUS_DIR="$FROM_PATH/porteus"
+    print_status "  Dari cmdline from=: $PORTEUS_DIR"
+else
+    scan_media || true
 fi
 
 if [ -z "$PORTEUS_DIR" ]; then
-    warn "Tidak bisa menemukan /porteus/base/*.xzm di media manapun!"
+    warn "Tidak bisa menemukan /porteus/base/*.xzm!"
+    warn "Block devices yang ada:"
+    ls -la /dev/sd* /dev/sr* /dev/vd* /dev/hd* 2>/dev/null || warn "  (tidak ada)"
+    warn "Isi /dev:"
+    ls /dev/
     emergency_shell
 fi
 
