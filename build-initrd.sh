@@ -147,9 +147,9 @@ extract_busybox_from_slax() {
     cd - >/dev/null
 
     info "Isi initramfs Slax:"
-    while read -r f; do
-    echo "    ${f#$slax_initrd_dir/}"
-    done < <(find "$slax_initrd_dir" -not -type d | head -20)
+    find "$slax_initrd_dir" -not -type d | head -20 | while read -r f; do
+        echo "    ${f#$slax_initrd_dir/}"
+    done
 
     # Cari binary busybox
     local bb=""
@@ -226,9 +226,9 @@ extract_gobo016_initrd_structure() {
     if mount -t cramfs -o loop,ro "$initrd016" "$cramfs_mnt" 2>/dev/null; then
         info "CramFS ter-mount di $cramfs_mnt"
         info "Isi GoboLinux 016 initrd:"
-	    while read -r f; do
-             echo "    ${f#$cramfs_mnt/}"
-			    done < <(find "$cramfs_mnt" -not -type d | head -40)
+        find "$cramfs_mnt" -not -type d | sort | head -40 | while read -r f; do
+            echo "    ${f#$cramfs_mnt/}"
+        done
 
         # Salin semua isi initrd 016 ke referensi
         cp -a "$cramfs_mnt/." "$WORK/gobo016-initrd/" 2>/dev/null || true
@@ -378,86 +378,133 @@ write_init() {
     cat > "$INITRD_DIR/init" << 'INIT_EOF'
 #!/bin/sh
 # /init — GoboLinux 017 Live, Porteus-style
-# ─────────────────────────────────────────────────────────────────────────────
-# Terinspirasi dari GoboLinux 016 InitRDScripts/bin/startGoboLinux
-# BusyBox dari Slax (statik, musl/uClibc)
-#
-# Urutan kerja (mengikuti logika startGoboLinux GoboLinux 016):
-#   1. Mount pseudo-filesystems
-#   2. Jalankan mdev untuk populate /dev
-#   3. Parse cmdline kernel
-#   4. Probe media → cari direktori /porteus/
-#   5. (opsional) copy2ram
-#   6. Mount semua .xzm via losetup + mount squashfs → OverlayFS
-#   7. Bangun GoboLinux System/Links di newroot
-#   8. switch_root ke GoboLinux 017
+# BusyBox dari Slax + logika GoboLinux 016 startGoboLinux
 
 export PATH=/bin:/sbin
 
-# ── Fungsi utilitas (style GoboLinux InitRDScripts) ──────────────────────────
 print_status() { echo "GoboLinux: $*"; }
-warn()         { echo "GoboLinux [WARN]: $*" >&2; }
+warn()         { echo "GoboLinux [WARN]: $*"; }
+
 emergency_shell() {
     echo ""
     echo "=== EMERGENCY SHELL ==="
-    echo "Ketik 'exit' untuk mencoba boot ulang"
+    echo "Diagnosis:"
+    echo "--- /proc/mounts ---"
+    cat /proc/mounts 2>/dev/null
+    echo "--- /sys/block ---"
+    ls /sys/block/ 2>/dev/null
+    echo "--- /dev ---"
+    ls /dev/ 2>/dev/null
+    echo "--- kernel cmdline ---"
+    cat /proc/cmdline 2>/dev/null
+    echo "--- dmesg tail ---"
+    dmesg 2>/dev/null | tail -20
+    echo ""
     exec /bin/sh
 }
 
-# ── 1. Pseudo-filesystems ─────────────────────────────────────────────────────
+# ── 1. Pseudo-filesystems ────────────────────────────────────────────────────
 mount -t proc     proc  /proc
 mount -t sysfs    sysfs /sys
 mount -t devtmpfs dev   /dev 2>/dev/null || mount -t tmpfs tmpfs /dev
 mkdir -p /dev/pts /dev/shm
-mount -t devpts   devpts /dev/pts 2>/dev/null || true
-mount -t tmpfs    tmpfs  /tmp
-mount -t tmpfs    tmpfs  /run
+mount -t devpts devpts /dev/pts 2>/dev/null || true
+mount -t tmpfs tmpfs /tmp
+mount -t tmpfs tmpfs /run
 
-print_status "Kernel $(uname -r)"
+print_status "Kernel: $(uname -r)"
 
-# ── 2. Load modul kernel dulu, BARU populate /dev ───────────────────────────
-# Urutan ini penting untuk Hyper-V: hv_storvsc harus load sebelum
-# disk SCSI muncul di /dev, dan squashfs/overlay/loop wajib ada
-# sebelum mount .xzm dilakukan.
-print_status "Load kernel modules..."
-for mod in squashfs overlay loop \
-           hv_vmbus hv_storvsc hv_netvsc hv_utils \
-           virtio virtio_pci virtio_blk virtio_net \
-           sd_mod sr_mod iso9660 vfat exfat; do
-    modprobe "$mod" 2>/dev/null || true
-done
+# ── 2. Buat device nodes dari /sys/block secara langsung ────────────────────
+# TIDAK mengandalkan mdev, udev, atau modprobe — semua dilakukan manual
+# menggunakan informasi dari /sys yang selalu tersedia di kernel modern.
+# Ini bekerja di Hyper-V, QEMU, VirtualBox, dan bare metal.
 
-# Setelah modul load, jalankan mdev agar device nodes muncul
-# /proc/sys/kernel/hotplug tidak tersedia di kernel GoboLinux 017
-# (CONFIG_UEVENT_HELPER sudah deprecated), jadi langsung mdev -s
-mdev -s 2>/dev/null || true
+make_blk_nodes() {
+    print_status "Membuat block device nodes dari /sys/block..."
+    local made=0
 
-# Hyper-V SCSI butuh waktu ~1-2 detik setelah hv_storvsc load
-# sebelum /dev/sda muncul — tunggu dengan polling
-wait_for_devices() {
+    for blk in /sys/block/*; do
+        [ -d "$blk" ] || continue
+        local name dev_file maj min
+
+        name="$(basename "$blk")"
+        dev_file="$blk/dev"
+        [ -f "$dev_file" ] || continue
+
+        # Baca major:minor langsung dari /sys/block/<name>/dev
+        local majmin; majmin="$(cat "$dev_file")"
+        maj="${majmin%%:*}"
+        min="${majmin##*:}"
+
+        local node="/dev/$name"
+        [ -b "$node" ] || mknod "$node" b "$maj" "$min" 2>/dev/null || true
+        [ -b "$node" ] && { print_status "  blk: $node ($maj:$min)"; made=$((made+1)); }
+
+        # Buat juga node untuk setiap partisi
+        for part in "$blk/${name}"[0-9] "$blk/${name}"[0-9][0-9] \
+                    "$blk/${name}p"[0-9] "$blk/${name}p"[0-9][0-9]; do
+            [ -d "$part" ] || continue
+            local pname; pname="$(basename "$part")"
+            local pdev_file="$part/dev"
+            [ -f "$pdev_file" ] || continue
+            local pmajmin; pmajmin="$(cat "$pdev_file")"
+            local pmaj="${pmajmin%%:*}"
+            local pmin="${pmajmin##*:}"
+            local pnode="/dev/$pname"
+            [ -b "$pnode" ] || mknod "$pnode" b "$pmaj" "$pmin" 2>/dev/null || true
+            [ -b "$pnode" ] && { print_status "  part: $pnode ($pmaj:$pmin)"; made=$((made+1)); }
+        done
+    done
+
+    print_status "Total: $made block nodes dibuat"
+    return 0
+}
+
+# Buat juga char device untuk optical drives via /sys/class/block
+make_chr_nodes() {
+    for cd in /sys/class/block/sr* /sys/class/block/scd*; do
+        [ -d "$cd" ] || continue
+        local name; name="$(basename "$cd")"
+        local dev_file="$cd/dev"
+        [ -f "$dev_file" ] || continue
+        local majmin; majmin="$(cat "$dev_file")"
+        local maj="${majmin%%:*}" min="${majmin##*:}"
+        local node="/dev/$name"
+        [ -b "$node" ] || mknod "$node" b "$maj" "$min" 2>/dev/null || true
+        print_status "  optical: $node ($maj:$min)"
+    done
+}
+
+make_blk_nodes
+make_chr_nodes
+
+# ── 3. Tunggu device Hyper-V / virtio yang mungkin belum muncul di /sys ─────
+# Hyper-V dan virtio-blk kadang butuh waktu setelah kernel init.
+# Kita tunggu sampai /sys/block punya minimal 1 entry selain 'loop*' dan 'ram*'
+
+wait_real_device() {
     local waited=0
-    local max_wait=10
-    while [ $waited -lt $max_wait ]; do
-        # Cek apakah ada minimal satu block device
-        for dev in /dev/sr? /dev/sd? /dev/vd? /dev/hd? /dev/mmcblk?; do
-            [ -b "$dev" ] && return 0
+    while [ $waited -lt 15 ]; do
+        for blk in /sys/block/*; do
+            local name; name="$(basename "$blk" 2>/dev/null)"
+            case "$name" in
+                loop*|ram*|zram*) continue ;;
+                ""|"*") continue ;;
+            esac
+            [ -d "$blk" ] && return 0
         done
         sleep 1
-        mdev -s 2>/dev/null || true
-        waited=$((waited + 1))
-        print_status "  Menunggu device... ($waited/${max_wait}s)"
+        waited=$((waited+1))
+        print_status "  Tunggu disk... ${waited}s"
+        # Ulangi buat nodes — device baru mungkin muncul di /sys
+        make_blk_nodes 2>/dev/null
     done
     return 1
 }
-wait_for_devices || warn "Timeout menunggu block devices"
 
-# Debug: tampilkan semua block device yang terdeteksi
-print_status "Block devices:"
-for dev in /dev/sr? /dev/sd?? /dev/sd? /dev/vd? /dev/mmcblk?p? /dev/mmcblk? /dev/hd?; do
-    [ -b "$dev" ] && echo "  found: $dev $(blkid "$dev" 2>/dev/null | grep -o 'TYPE="[^"]*"' || true)"
-done
+wait_real_device || warn "Tidak ada disk terdeteksi setelah 15 detik"
 
-# ── 3. Parse cmdline ──────────────────────────────────────────────────────────
+# ── 4. Parse cmdline ─────────────────────────────────────────────────────────
 FROM_PATH=""
 CHANGES_PATH=""
 COPY2RAM=0
@@ -466,303 +513,230 @@ LOAD_LIST=""
 
 for p in $(cat /proc/cmdline); do
     case "$p" in
-        from=*)     FROM_PATH="${p#from=}"       ;;
-        changes=*)  CHANGES_PATH="${p#changes=}" ;;
-        copy2ram)   COPY2RAM=1                   ;;
-        nomagic)    NOMAGIC=1                    ;;
-        load=*)     LOAD_LIST="$LOAD_LIST ${p#load=}" ;;
+        from=*)    FROM_PATH="${p#from=}"       ;;
+        changes=*) CHANGES_PATH="${p#changes=}" ;;
+        copy2ram)  COPY2RAM=1                   ;;
+        nomagic)   NOMAGIC=1                    ;;
+        load=*)    LOAD_LIST="$LOAD_LIST ${p#load=}" ;;
     esac
 done
 
-# ── 4. Probe media — cari /porteus/base/*.xzm ────────────────────────────────
+# ── 5. Cari /porteus/base/*.xzm di semua block device ───────────────────────
 print_status "Mencari media boot..."
 
 PORTEUS_DIR=""
 MEDIA_MNT=""
+SCAN_MNT="/mnt/media/scan"
+mkdir -p "$SCAN_MNT"
 
-try_mount_and_find() {
-    local dev="$1" fs="$2" mnt="$3"
-    mkdir -p "$mnt"
-    mount -t "$fs" -o ro "$dev" "$mnt" 2>/dev/null || return 1
-    if [ -d "$mnt/porteus/base" ] && \
-       ls "$mnt/porteus/base/"*.xzm >/dev/null 2>&1; then
-        print_status "  -> $dev ($fs): OK"
+try_mount_find() {
+    local dev="$1" fs="$2"
+    # Umount dulu kalau masih ter-mount
+    umount "$SCAN_MNT" 2>/dev/null || true
+    mount -t "$fs" -o ro "$dev" "$SCAN_MNT" 2>/dev/null || return 1
+    if [ -d "$SCAN_MNT/porteus/base" ] && \
+       ls "$SCAN_MNT/porteus/base/"*.xzm >/dev/null 2>&1; then
         return 0
     fi
-    umount "$mnt" 2>/dev/null || true
+    umount "$SCAN_MNT" 2>/dev/null || true
     return 1
 }
 
-scan_media() {
-    local SCAN_MNT="/mnt/media/scan"
-    mkdir -p "$SCAN_MNT"
-    # Optical drive duluan (ISO boot), lalu disk
-    for dev in /dev/sr? /dev/sr?? \
-               /dev/sd? /dev/sd?? \
-               /dev/vd? /dev/hd? \
-               /dev/mmcblk?p? /dev/mmcblk?; do
+scan_all_devices() {
+    # Kumpulkan semua block device dari /sys/block
+    local devlist=""
+    for blk in /sys/block/*; do
+        local name; name="$(basename "$blk")"
+        case "$name" in loop*|ram*|zram*) continue ;; esac
+        [ -b "/dev/$name" ] || continue
+
+        # Coba seluruh disk dulu (untuk ISO yang tidak berpartisi)
+        devlist="$devlist /dev/$name"
+
+        # Lalu partisi-partisinya
+        for part in /dev/${name}[0-9] /dev/${name}[0-9][0-9] \
+                    /dev/${name}p[0-9] /dev/${name}p[0-9][0-9]; do
+            [ -b "$part" ] && devlist="$devlist $part"
+        done
+    done
+
+    print_status "Scan devices: $devlist"
+
+    for dev in $devlist; do
         [ -b "$dev" ] || continue
-        print_status "  Coba: $dev"
+        print_status "  -> $dev"
         for fs in iso9660 udf vfat exfat ext4 ext3 ext2; do
-            if try_mount_and_find "$dev" "$fs" "$SCAN_MNT"; then
+            if try_mount_find "$dev" "$fs"; then
                 PORTEUS_DIR="$SCAN_MNT/porteus"
                 MEDIA_MNT="$SCAN_MNT"
+                print_status "  FOUND: $dev ($fs) -> $PORTEUS_DIR"
                 return 0
             fi
         done
-        # Coba partisi di dalam disk ini
-        for part in "${dev}1" "${dev}2" "${dev}p1" "${dev}p2"; do
-            [ -b "$part" ] || continue
-            for fs in vfat exfat ext4 ext3 ext2 iso9660; do
-                if try_mount_and_find "$part" "$fs" "$SCAN_MNT"; then
-                    PORTEUS_DIR="$SCAN_MNT/porteus"
-                    MEDIA_MNT="$SCAN_MNT"
-                    return 0
-                fi
-            done
-        done
     done
     return 1
 }
 
-if [ -n "$FROM_PATH" ] && [ -d "$FROM_PATH/porteus/base" ]; then
-    PORTEUS_DIR="$FROM_PATH/porteus"
-    print_status "  Dari cmdline from=: $PORTEUS_DIR"
-else
-    scan_media || true
+if [ -n "$FROM_PATH" ]; then
+    # from= bisa berupa device (from=/dev/sda1) atau path (from=/porteus)
+    case "$FROM_PATH" in
+        /dev/*)
+            for fs in iso9660 vfat ext4 ext3 ext2 udf; do
+                try_mount_find "$FROM_PATH" "$fs" && {
+                    PORTEUS_DIR="$SCAN_MNT/porteus"
+                    MEDIA_MNT="$SCAN_MNT"
+                    break
+                }
+            done ;;
+        *)
+            [ -d "$FROM_PATH/porteus/base" ] && PORTEUS_DIR="$FROM_PATH/porteus" ;;
+    esac
 fi
 
+[ -z "$PORTEUS_DIR" ] && scan_all_devices || true
+
 if [ -z "$PORTEUS_DIR" ]; then
-    warn "Tidak bisa menemukan /porteus/base/*.xzm!"
-    warn "Block devices yang ada:"
-    ls -la /dev/sd* /dev/sr* /dev/vd* /dev/hd* 2>/dev/null || warn "  (tidak ada)"
-    warn "Isi /dev:"
-    ls /dev/
+    warn "GAGAL menemukan /porteus/base/*.xzm"
+    warn "/sys/block:"
+    ls /sys/block/ 2>/dev/null
+    warn "/dev:"
+    ls /dev/ 2>/dev/null
     emergency_shell
 fi
 
-# ── 5. Copy to RAM (opsional) ─────────────────────────────────────────────────
+# ── 6. Copy to RAM (opsional) ────────────────────────────────────────────────
 if [ "$COPY2RAM" = "1" ]; then
     print_status "copy2ram: menyalin ke RAM..."
-    RAM_MNT="/mnt/media/ram"
+    RAM_MNT="/mnt/ram"
     mkdir -p "$RAM_MNT"
-    # Estimasi ukuran
     SZ=$(du -sk "$PORTEUS_DIR" 2>/dev/null | cut -f1)
-    SZ_MB=$(( (SZ / 1024) + 64 ))
+    SZ_MB=$(( (SZ / 1024) + 128 ))
     mount -t tmpfs -o "size=${SZ_MB}m" tmpfs "$RAM_MNT"
-    cp -a "$PORTEUS_DIR" "$RAM_MNT/"
+    cp -a "$PORTEUS_DIR/." "$RAM_MNT/"
     sync
-    # Umount media fisik
     [ -n "$MEDIA_MNT" ] && umount "$MEDIA_MNT" 2>/dev/null || true
-    PORTEUS_DIR="$RAM_MNT/porteus"
-    print_status "  Semua modul ada di RAM (${SZ_MB}MB)"
+    PORTEUS_DIR="$RAM_MNT"
+    print_status "  Selesai (${SZ_MB}MB di RAM)"
 fi
 
-# ── 6. Mount .xzm → OverlayFS ─────────────────────────────────────────────────
-# GoboLinux 016 mount satu squashfs utama; kita mount banyak .xzm
-# dan tumpuk dengan OverlayFS (seperti Porteus)
+# ── 7. Mount .xzm → OverlayFS ────────────────────────────────────────────────
 print_status "Mounting modul .xzm..."
 
 XZM_BASE="/mnt/xzm"
-OVERLAY_UPPER="/mnt/overlay/upper"
-OVERLAY_WORK="/mnt/overlay/work"
+UPPER="/mnt/overlay/upper"
+WORK="/mnt/overlay/work"
 NEWROOT="/mnt/newroot"
-mkdir -p "$XZM_BASE" "$OVERLAY_UPPER" "$OVERLAY_WORK" "$NEWROOT"
+mkdir -p "$XZM_BASE" "$UPPER" "$WORK" "$NEWROOT"
 
-LOWER_DIRS=""
+LOWER=""
 IDX=0
 
-mount_one_xzm() {
-    local xzm="$1"
+mount_xzm() {
+    local f="$1"
     local mpt="$XZM_BASE/$IDX"
     mkdir -p "$mpt"
-    if mount -t squashfs -o loop,ro "$xzm" "$mpt" 2>/dev/null; then
-        print_status "  + $(basename "$xzm")"
-        if [ -z "$LOWER_DIRS" ]; then
-            LOWER_DIRS="$mpt"
-        else
-            LOWER_DIRS="$LOWER_DIRS:$mpt"
-        fi
-        IDX=$((IDX + 1))
+    if mount -t squashfs -o loop,ro "$f" "$mpt" 2>/dev/null; then
+        print_status "  + $(basename "$f")"
+        [ -z "$LOWER" ] && LOWER="$mpt" || LOWER="$LOWER:$mpt"
+        IDX=$((IDX+1))
         return 0
-    else
-        warn "  ! Gagal mount: $(basename "$xzm")"
-        return 1
     fi
+    warn "  gagal: $(basename "$f")"
+    return 1
 }
 
-# base/*.xzm (wajib, urutan numerik)
 for xzm in $(ls "$PORTEUS_DIR/base/"*.xzm 2>/dev/null | sort); do
-    mount_one_xzm "$xzm"
+    mount_xzm "$xzm"
 done
-
-# modules/*.xzm (aktif setiap boot)
 for xzm in $(ls "$PORTEUS_DIR/modules/"*.xzm 2>/dev/null | sort); do
-    mount_one_xzm "$xzm"
+    mount_xzm "$xzm"
 done
-
-# optional via load= cmdline
 for name in $LOAD_LIST; do
-    for xzm in \
-        "$PORTEUS_DIR/optional/$name" \
-        "$PORTEUS_DIR/optional/${name}.xzm"
-    do
-        [ -f "$xzm" ] && mount_one_xzm "$xzm" && break
+    for f in "$PORTEUS_DIR/optional/$name" "$PORTEUS_DIR/optional/${name}.xzm"; do
+        [ -f "$f" ] && mount_xzm "$f" && break
     done
 done
 
-[ -n "$LOWER_DIRS" ] || { warn "Tidak ada .xzm berhasil di-mount!"; emergency_shell; }
+[ -n "$LOWER" ] || { warn "Tidak ada .xzm berhasil di-mount"; emergency_shell; }
 
-# Upper layer: tmpfs (default) atau persistent (changes=)
-if [ "$NOMAGIC" != "1" ] && [ -n "$CHANGES_PATH" ]; then
-    mkdir -p "$CHANGES_PATH" "$OVERLAY_WORK"
-    UPPER="$CHANGES_PATH"
+# Upper layer
+if [ "$NOMAGIC" = "1" ] || [ -z "$CHANGES_PATH" ]; then
+    mount -t tmpfs tmpfs "$UPPER"
+    UPPER_DIR="$UPPER"
 else
-    mount -t tmpfs tmpfs "$OVERLAY_UPPER"
-    mkdir -p "$OVERLAY_UPPER" "$OVERLAY_WORK"
-    UPPER="$OVERLAY_UPPER"
+    mkdir -p "$CHANGES_PATH"
+    UPPER_DIR="$CHANGES_PATH"
 fi
+mkdir -p "$UPPER_DIR" "$WORK"
 
-print_status "Mounting OverlayFS..."
 mount -t overlay overlay \
-    -o "lowerdir=$LOWER_DIRS,upperdir=$UPPER,workdir=$OVERLAY_WORK" \
-    "$NEWROOT" \
-|| { warn "OverlayFS gagal!"; emergency_shell; }
+    -o "lowerdir=$LOWER,upperdir=$UPPER_DIR,workdir=$WORK" \
+    "$NEWROOT" || { warn "OverlayFS gagal"; emergency_shell; }
 
-print_status "  newroot: $NEWROOT"
+print_status "OverlayFS OK: $NEWROOT"
 
-# ── 7. Setup GoboLinux System/Links ──────────────────────────────────────────
-# Direplikasi dari logika GoboLinux 016 startGoboLinux:
-# "the SquashFS images are mounted, the pivot operation to make it
-#  the root directory is performed"
-# Kita tambahkan: build System/Links sebelum pivot/switch_root
-print_status "Membangun GoboLinux System/Links..."
+# ── 8. GoboLinux System/Links ────────────────────────────────────────────────
+print_status "Membangun System/Links..."
 
-[ -d "$NEWROOT/Programs" ] || { warn "Programs/ tidak ada di newroot"; }
+[ -d "$NEWROOT/Programs" ] && \
+find "$NEWROOT/Programs" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | \
+while read -r prog; do
+    local name; name="$(basename "$prog")"
+    local ver=""
+    [ -L "$prog/Current" ] && ver="$(readlink -f "$prog/Current" 2>/dev/null)"
+    [ -d "$ver" ] || ver="$(find "$prog" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -1)"
+    [ -d "$ver" ] || continue
+    [ -e "$prog/Current" ] || ln -snf "$ver" "$prog/Current" 2>/dev/null
 
-build_links() {
-    local root="$1"
-    local prog_dir="$root/Programs"
-    local links_dir="$root/System/Links"
+    mkdir -p "$NEWROOT/System/Links/Executables" \
+             "$NEWROOT/System/Links/Libraries"
 
-    mkdir -p \
-        "$links_dir/Executables" \
-        "$links_dir/Libraries" \
-        "$links_dir/Headers" \
-        "$links_dir/Settings" \
-        "$links_dir/Manuals"
-
-    [ -d "$prog_dir" ] || return 0
-
-    find "$prog_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | \
-    while read -r prog; do
-        local name; name="$(basename "$prog")"
-
-        # Resolve Current → versi aktif
-        local ver=""
-        if [ -L "$prog/Current" ]; then
-            ver="$(readlink -f "$prog/Current" 2>/dev/null)"
-        fi
-        [ -d "$ver" ] || ver="$(find "$prog" -mindepth 1 -maxdepth 1 \
-            -type d 2>/dev/null | sort -V | tail -1)"
-        [ -d "$ver" ] || continue
-
-        # Buat Current jika belum ada
-        [ -e "$prog/Current" ] || ln -snf "$ver" "$prog/Current" 2>/dev/null
-
-        # Executables: bin/ sbin/
-        for sub in bin sbin; do
-            [ -d "$ver/$sub" ] || continue
-            find "$ver/$sub" -maxdepth 1 \( -type f -o -type l \) 2>/dev/null | \
-            while read -r f; do
-                local dst="$links_dir/Executables/$(basename "$f")"
-                [ -e "$dst" ] || ln -s "$f" "$dst" 2>/dev/null
-            done
+    for sub in bin sbin; do
+        [ -d "$ver/$sub" ] && find "$ver/$sub" -maxdepth 1 \( -type f -o -type l \) | \
+        while read -r f; do
+            local d="$NEWROOT/System/Links/Executables/$(basename "$f")"
+            [ -e "$d" ] || ln -s "$f" "$d" 2>/dev/null
         done
-
-        # Libraries: lib/ lib64/
-        for sub in lib lib64; do
-            [ -d "$ver/$sub" ] || continue
-            find "$ver/$sub" -maxdepth 1 \( -type f -o -type l \) 2>/dev/null | \
-            while read -r f; do
-                local dst="$links_dir/Libraries/$(basename "$f")"
-                [ -e "$dst" ] || ln -s "$f" "$dst" 2>/dev/null
-            done
-        done
-
-        # Settings: etc/ (symlink seluruh direktori per program)
-        [ -d "$ver/etc" ] && {
-            local sdst="$links_dir/Settings/$name"
-            [ -e "$sdst" ] || ln -s "$ver/etc" "$sdst" 2>/dev/null
-        }
     done
-}
+    for sub in lib lib64; do
+        [ -d "$ver/$sub" ] && find "$ver/$sub" -maxdepth 1 \( -type f -o -type l \) | \
+        while read -r f; do
+            local d="$NEWROOT/System/Links/Libraries/$(basename "$f")"
+            [ -e "$d" ] || ln -s "$f" "$d" 2>/dev/null
+        done
+    done
+done
 
-build_links "$NEWROOT"
-print_status "  System/Links selesai"
-
-# ── FHS compat (seperti GoboLinux 016 via legacy symlinks) ───────────────────
-# GoboLinux 016 sudah memiliki symlinks ini di ROLayer; kita pastikan ada
-for pair in \
-    "/bin:/System/Links/Executables" \
-    "/sbin:/System/Links/Executables" \
-    "/lib:/System/Links/Libraries" \
-    "/lib64:/System/Links/Libraries"
-do
-    link="${pair%%:*}"
-    tgt="${pair#*:}"
-    [ -e "$NEWROOT$link" ] || ln -s "$tgt" "$NEWROOT$link" 2>/dev/null || true
+# FHS symlinks
+for pair in "bin:/System/Links/Executables" "sbin:/System/Links/Executables" \
+            "lib:/System/Links/Libraries"   "lib64:/System/Links/Libraries"; do
+    lnk="${pair%%:*}"; tgt="${pair#*:}"
+    [ -e "$NEWROOT/$lnk" ] || ln -s "$tgt" "$NEWROOT/$lnk" 2>/dev/null || true
 done
 [ -e "$NEWROOT/usr" ] || ln -s "/" "$NEWROOT/usr" 2>/dev/null || true
 
-# System/Kernel links
-if [ -d "$NEWROOT/Programs/Linux" ]; then
-    linux_dir="$NEWROOT/Programs/Linux"
-    kver=$(find "$linux_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null \
-           | grep -v Current | sort -V | tail -1 | xargs basename 2>/dev/null || true)
-    if [ -n "$kver" ]; then
-        mkdir -p "$NEWROOT/System/Kernel"
-        kpath="$linux_dir/$kver"
-        [ -d "$kpath/boot"        ] && \
-            ln -snf "$kpath/boot"        "$NEWROOT/System/Kernel/Boot"    2>/dev/null || true
-        [ -d "$kpath/lib/modules" ] && \
-            ln -snf "$kpath/lib/modules" "$NEWROOT/System/Kernel/Modules" 2>/dev/null || true
-        print_status "  System/Kernel: Linux $kver"
-    fi
-fi
+# ── 9. Handoff ───────────────────────────────────────────────────────────────
+print_status "switch_root..."
 
-# ── 8. Handoff ke GoboLinux ───────────────────────────────────────────────────
-# Seperti GoboLinux 016: mount ulang pseudo-fs di newroot, lalu switch_root
-# (GoboLinux 016 pakai pivot_root; kita pakai switch_root karena initramfs)
-print_status "Handoff ke GoboLinux 017..."
-
-for fs_arg in "proc proc /proc" "sysfs sysfs /sys" "devtmpfs dev /dev" "tmpfs tmpfs /run"; do
-    t="${fs_arg%% *}"; rest="${fs_arg#* }"; src="${rest%% *}"; dst="${rest#* }"
+for fsinfo in "proc:proc:/proc" "sysfs:sysfs:/sys" "devtmpfs:dev:/dev" "tmpfs:tmpfs:/run"; do
+    t="${fsinfo%%:*}"; rest="${fsinfo#*:}"; src="${rest%%:*}"; dst="${rest#*:}"
     mount -t "$t" "$src" "$NEWROOT/$dst" 2>/dev/null || \
     mount --bind "/$dst" "$NEWROOT/$dst" 2>/dev/null || true
 done
 mkdir -p "$NEWROOT/dev/pts"
 mount -t devpts devpts "$NEWROOT/dev/pts" 2>/dev/null || true
 
-# Cari init GoboLinux (GoboLinux 016: /sbin/init memanggil BootDriver)
-NEWROOT_INIT=""
-for candidate in \
-    "$NEWROOT/sbin/init" \
-    "$NEWROOT/System/Links/Executables/init" \
-    "$NEWROOT/bin/init" \
-    "$NEWROOT/Programs/Sysvinit/Current/sbin/init" \
-    "$NEWROOT/Programs/Scripts/Current/bin/StartGoboLinux"
-do
-    [ -x "$candidate" ] && { NEWROOT_INIT="${candidate#$NEWROOT}"; break; }
+INIT=""
+for c in "$NEWROOT/sbin/init" "$NEWROOT/System/Links/Executables/init" \
+          "$NEWROOT/bin/init"  "$NEWROOT/Programs/Sysvinit/Current/sbin/init"; do
+    [ -x "$c" ] && { INIT="${c#$NEWROOT}"; break; }
 done
+[ -n "$INIT" ] || INIT="/bin/sh"
 
-[ -n "$NEWROOT_INIT" ] || NEWROOT_INIT="/bin/sh"
+print_status "exec: switch_root $NEWROOT $INIT"
+exec switch_root "$NEWROOT" "$INIT"
 
-print_status "switch_root -> $NEWROOT_INIT"
-exec switch_root "$NEWROOT" "$NEWROOT_INIT"
-
-# Tidak seharusnya sampai sini
-warn "switch_root gagal!"
+warn "switch_root gagal"
 emergency_shell
 INIT_EOF
 
