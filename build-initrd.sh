@@ -146,10 +146,11 @@ extract_busybox_from_slax() {
     fi
     cd - >/dev/null
 
-    info "Isi initramfs Slax:"
-    find "$slax_initrd_dir" -not -type d | head -20 | while read -r f; do
-        echo "    ${f#$slax_initrd_dir/}"
-    done
+    while read -r f; do
+
+    echo " ${f#$slax_initrd_dir/}"
+    done < <(find "$slax_initrd_dir" -not -type d | head -20)
+
 
     # Cari binary busybox
     local bb=""
@@ -226,10 +227,9 @@ extract_gobo016_initrd_structure() {
     if mount -t cramfs -o loop,ro "$initrd016" "$cramfs_mnt" 2>/dev/null; then
         info "CramFS ter-mount di $cramfs_mnt"
         info "Isi GoboLinux 016 initrd:"
-        find "$cramfs_mnt" -not -type d | sort | head -40 | while read -r f; do
-            echo "    ${f#$cramfs_mnt/}"
-        done
-
+        while read -r f; do
+        echo " ${f#$cramfs_mnt/}"
+        done < <(find "$cramfs_mnt" -not -type d | head -40)
         # Salin semua isi initrd 016 ke referensi
         cp -a "$cramfs_mnt/." "$WORK/gobo016-initrd/" 2>/dev/null || true
         umount "$cramfs_mnt"
@@ -505,7 +505,8 @@ write_init() {
 #!/bin/sh
 # /init — GoboLinux 017 Live, Porteus-style
 # BusyBox (Slax) + modul kernel dari GoboLinux 017
-# ── TIDAK pakai 'local' di luar fungsi — kompatibel dengan ash/dash ──────────
+# Tidak pakai 'basename' sebagai command — pakai parameter expansion
+# Tidak pakai 'local' di luar fungsi
 
 export PATH=/bin:/sbin
 
@@ -513,13 +514,12 @@ print_status() { echo "GoboLinux: $*"; }
 warn()         { echo "GoboLinux [WARN]: $*"; }
 
 emergency_shell() {
-    echo ""
     echo "=== EMERGENCY SHELL ==="
-    echo "--- /proc/cmdline ---"; cat /proc/cmdline
-    echo "--- /sys/block ---";    ls /sys/block/ 2>/dev/null || echo "(kosong)"
-    echo "--- /dev ---";          ls /dev/ 2>/dev/null
-    echo "--- /proc/modules ---"; cat /proc/modules 2>/dev/null | cut -d' ' -f1 | head -20
-    echo "--- dmesg ---";         dmesg 2>/dev/null | grep -iE "cdrom|sr0|scsi|ahci|sata|nvme|virtio|hv_" | tail -20
+    echo "--- cmdline:"; cat /proc/cmdline
+    echo "--- /sys/block:"; ls /sys/block/ 2>/dev/null
+    echo "--- /dev:"; ls /dev/ 2>/dev/null
+    echo "--- modules:"; cat /proc/modules 2>/dev/null | cut -d' ' -f1
+    echo "--- dmesg:"; dmesg 2>/dev/null | tail -30
     exec /bin/sh
 }
 
@@ -531,104 +531,156 @@ mkdir -p /dev/pts /dev/shm
 mount -t devpts devpts /dev/pts 2>/dev/null || true
 mount -t tmpfs tmpfs /tmp
 mount -t tmpfs tmpfs /run
-
 print_status "Kernel: $(uname -r)"
 
-# ── 2. Load modul kernel ─────────────────────────────────────────────────────
-# Modul sudah disalin dari GoboLinux 017 ke /lib/modules/ di dalam initramfs
-# oleh build-initrd.sh (copy_kernel_modules), jadi modprobe akan bekerja.
-print_status "Loading kernel modules..."
+# ── 2. Load modul kernel dengan insmod eksplisit (tanpa dependency modprobe) ─
+# modprobe butuh modules.dep yang lengkap dan benar.
+# insmod lebih reliable di initramfs karena kita kontrol urutan sendiri.
+# Modul sudah disalin oleh copy_kernel_modules() di build-initrd.sh.
+print_status "Loading modules..."
 
-# Urutan penting: dependencies dulu
-for mod in \
-    scsi_mod scsi_common \
-    cdrom sr_mod \
-    isofs squashfs overlay loop \
-    hv_vmbus hv_storvsc hv_utils \
-    virtio virtio_ring virtio_pci virtio_blk virtio_scsi \
-    usb_storage xhci_hcd xhci_pci ehci_hcd ehci_pci \
-    fat vfat \
-; do
-    modprobe "$mod" 2>/dev/null && print_status "  loaded: $mod" || true
-done
+KVER=$(uname -r)
+MDIR="/lib/modules/$KVER"
 
-# ── 3. Buat device nodes dari /sys/block + /sys/class/block ─────────────────
-print_status "Buat device nodes..."
-
-# Fungsi: buat satu node dari file /sys/.../dev
-make_node_from_sysdev() {
-    sysdev_file="$1"
-    node_path="$2"
-    [ -f "$sysdev_file" ] || return 1
-    majmin=$(cat "$sysdev_file")
-    maj="${majmin%%:*}"
-    min="${majmin##*:}"
-    [ -b "$node_path" ] || mknod "$node_path" b "$maj" "$min" 2>/dev/null || true
-    [ -b "$node_path" ] && print_status "  node: $node_path ($maj:$min)"
+# Helper: cari file .ko di mana saja dalam MDIR, load dengan insmod
+load_mod() {
+    modname="$1"
+    # Cari file .ko — ganti - dengan [ _-] untuk match keduanya
+    kofile=$(find "$MDIR" -name "${modname}.ko" -o -name "${modname}.ko.xz" \
+             -o -name "${modname}.ko.zst" 2>/dev/null | head -1)
+    # Coba juga dengan dash diganti underscore dan sebaliknya
+    if [ -z "$kofile" ]; then
+        alt=$(echo "$modname" | tr '-' '_')
+        kofile=$(find "$MDIR" -name "${alt}.ko" 2>/dev/null | head -1)
+    fi
+    if [ -z "$kofile" ]; then
+        alt=$(echo "$modname" | tr '_' '-')
+        kofile=$(find "$MDIR" -name "${alt}.ko" 2>/dev/null | head -1)
+    fi
+    if [ -n "$kofile" ]; then
+        insmod "$kofile" 2>/dev/null && \
+            print_status "  insmod: $modname" || \
+            print_status "  skip (sudah ada?): $modname"
+        return 0
+    fi
+    # Fallback ke modprobe jika insmod tidak bisa
+    modprobe "$modname" 2>/dev/null && print_status "  modprobe: $modname" || true
+    return 0
 }
 
-# Semua block device di /sys/block/
-for blk_sys in /sys/block/*; do
-    blk_name=$(basename "$blk_sys")
-    make_node_from_sysdev "$blk_sys/dev" "/dev/$blk_name"
-    # Partisi
-    for part_sys in "$blk_sys/${blk_name}"[0-9] \
-                    "$blk_sys/${blk_name}"[0-9][0-9] \
-                    "$blk_sys/${blk_name}p"[0-9] \
-                    "$blk_sys/${blk_name}p"[0-9][0-9]; do
-        [ -d "$part_sys" ] || continue
-        part_name=$(basename "$part_sys")
-        make_node_from_sysdev "$part_sys/dev" "/dev/$part_name"
+# Urutan eksplisit — dependency dulu
+# SCSI core
+load_mod scsi_mod
+load_mod scsi_common
+
+# Hyper-V: hv_vmbus WAJIB sebelum hv_storvsc
+load_mod hv_vmbus
+load_mod hv_storvsc
+load_mod hv_utils
+
+# VirtIO (QEMU/KVM)
+load_mod virtio
+load_mod virtio_ring
+load_mod virtio_pci
+load_mod virtio_blk
+load_mod virtio_scsi
+
+# Optical drive
+load_mod cdrom
+load_mod sr_mod
+
+# Filesystem
+load_mod isofs
+load_mod squashfs
+load_mod overlay
+load_mod loop
+load_mod fat
+load_mod vfat
+
+# USB (untuk boot dari USB)
+load_mod usb_common
+load_mod usbcore
+load_mod xhci_hcd
+load_mod xhci_pci
+load_mod ehci_hcd
+load_mod ehci_pci
+load_mod usb_storage
+
+# ── 3. Buat device nodes dari /sys/block ─────────────────────────────────────
+# Gunakan parameter expansion bukan basename (lebih portable di ash BusyBox)
+print_status "Buat device nodes..."
+
+make_node() {
+    sysf="$1"
+    node="$2"
+    [ -f "$sysf" ] || return 1
+    mm=$(cat "$sysf")
+    mknod "$node" b "${mm%%:*}" "${mm##*:}" 2>/dev/null || true
+    [ -b "$node" ] && print_status "  $node (${mm%%:*}:${mm##*:})"
+}
+
+scan_and_make_nodes() {
+    for blk in /sys/block/*; do
+        [ -d "$blk" ] || continue
+        # Pakai ${blk##*/} bukan basename — tidak butuh basename applet
+        bname="${blk##*/}"
+        make_node "$blk/dev" "/dev/$bname"
+        # Partisi
+        for part in "$blk/$bname"[0-9] "$blk/${bname}"[0-9][0-9] \
+                    "$blk/${bname}p"[0-9] "$blk/${bname}p"[0-9][0-9]; do
+            [ -d "$part" ] || continue
+            pname="${part##*/}"
+            make_node "$part/dev" "/dev/$pname"
+        done
     done
-done
+    # Optical via /sys/class/block
+    for cd in /sys/class/block/sr* /sys/class/block/scd*; do
+        [ -d "$cd" ] || continue
+        cdname="${cd##*/}"
+        make_node "$cd/dev" "/dev/$cdname"
+    done
+}
 
-# Optical drives juga lewat /sys/class/block/
-for cd_sys in /sys/class/block/sr* /sys/class/block/scd*; do
-    [ -d "$cd_sys" ] || continue
-    cd_name=$(basename "$cd_sys")
-    make_node_from_sysdev "$cd_sys/dev" "/dev/$cd_name"
-done
+scan_and_make_nodes
 
-# ── 4. Tunggu device muncul (Hyper-V / virtio butuh beberapa detik) ──────────
-print_status "Menunggu storage devices..."
+# ── 4. Tunggu storage device muncul di /sys/block ────────────────────────────
+print_status "Tunggu storage device..."
 waited=0
 while [ $waited -lt 20 ]; do
-    found_real=0
-    for blk_sys in /sys/block/*; do
-        blk_name=$(basename "$blk_sys" 2>/dev/null)
-        case "$blk_name" in
-            loop*|ram*|zram*|""|"*") continue ;;
+    found=0
+    for blk in /sys/block/*; do
+        [ -d "$blk" ] || continue
+        bname="${blk##*/}"
+        case "$bname" in
+            loop*|ram*|zram*|"*") continue ;;
         esac
-        [ -d "$blk_sys" ] && found_real=1 && break
+        found=1
+        break
     done
 
-    if [ $found_real -eq 1 ]; then
-        print_status "  Device ditemukan setelah ${waited}s"
-        # Buat node untuk device yang baru muncul
-        for blk_sys in /sys/block/*; do
-            blk_name=$(basename "$blk_sys")
-            case "$blk_name" in loop*|ram*|zram*) continue ;; esac
-            make_node_from_sysdev "$blk_sys/dev" "/dev/$blk_name"
-            for part_sys in "$blk_sys/${blk_name}"[0-9] "$blk_sys/${blk_name}p"[0-9]; do
-                [ -d "$part_sys" ] || continue
-                part_name=$(basename "$part_sys")
-                make_node_from_sysdev "$part_sys/dev" "/dev/$part_name"
-            done
-        done
+    if [ $found -eq 1 ]; then
+        print_status "  Storage muncul setelah ${waited}s"
+        scan_and_make_nodes
         break
     fi
+
     sleep 1
     waited=$((waited+1))
-    # Coba load modul lagi (untuk hotplug yang lambat)
-    modprobe sr_mod   2>/dev/null || true
-    modprobe hv_storvsc 2>/dev/null || true
-    modprobe virtio_blk 2>/dev/null || true
+    print_status "  ${waited}s..."
+
+    # Retry load modul Hyper-V (kadang perlu beberapa detik)
+    load_mod hv_vmbus   2>/dev/null
+    load_mod hv_storvsc 2>/dev/null
+    load_mod virtio_blk 2>/dev/null
+    load_mod sr_mod     2>/dev/null
 done
 
-print_status "Block devices:"
-ls /sys/block/ 2>/dev/null
-ls /dev/sd* /dev/sr* /dev/vd* /dev/hd* 2>/dev/null | while read d; do
-    print_status "  $d"
+print_status "Storage devices:"
+for blk in /sys/block/*; do
+    [ -d "$blk" ] || continue
+    bname="${blk##*/}"
+    case "$bname" in loop*|ram*|zram*) continue ;; esac
+    print_status "  /dev/$bname"
 done
 
 # ── 5. Parse cmdline ─────────────────────────────────────────────────────────
@@ -649,17 +701,16 @@ for p in $(cat /proc/cmdline); do
 done
 
 # ── 6. Cari /porteus/base/*.xzm ──────────────────────────────────────────────
-print_status "Mencari media boot (porteus/)..."
-
+print_status "Cari media boot..."
 PORTEUS_DIR=""
 MEDIA_MNT=""
-SCAN_MNT="/mnt/media/scan"
+SCAN_MNT="/mnt/scan"
 mkdir -p "$SCAN_MNT"
 
 try_one() {
-    dev="$1" fs="$2"
+    tdev="$1" tfs="$2"
     umount "$SCAN_MNT" 2>/dev/null || true
-    mount -t "$fs" -o ro "$dev" "$SCAN_MNT" 2>/dev/null || return 1
+    mount -t "$tfs" -o ro "$tdev" "$SCAN_MNT" 2>/dev/null || return 1
     if [ -d "$SCAN_MNT/porteus/base" ] && \
        ls "$SCAN_MNT/porteus/base/"*.xzm >/dev/null 2>&1; then
         return 0
@@ -669,30 +720,25 @@ try_one() {
 }
 
 scan_devices() {
-    # Kumpulkan semua device dari /sys/block
-    devlist=""
-    for blk_sys in /sys/block/*; do
-        blk_name=$(basename "$blk_sys")
-        case "$blk_name" in loop*|ram*|zram*) continue ;; esac
-        [ -b "/dev/$blk_name" ] || continue
-        devlist="$devlist /dev/$blk_name"
-        for p in /dev/${blk_name}[0-9] /dev/${blk_name}[0-9][0-9] \
-                 /dev/${blk_name}p[0-9] /dev/${blk_name}p[0-9][0-9]; do
-            [ -b "$p" ] && devlist="$devlist $p"
-        done
-    done
+    for blk in /sys/block/*; do
+        [ -d "$blk" ] || continue
+        bname="${blk##*/}"
+        case "$bname" in loop*|ram*|zram*) continue ;; esac
+        [ -b "/dev/$bname" ] || continue
 
-    print_status "Scan: $devlist"
-    for dev in $devlist; do
-        [ -b "$dev" ] || continue
-        print_status "  try: $dev"
-        for fs in iso9660 udf vfat exfat ext4 ext3 ext2; do
-            if try_one "$dev" "$fs"; then
-                PORTEUS_DIR="$SCAN_MNT/porteus"
-                MEDIA_MNT="$SCAN_MNT"
-                print_status "  FOUND: $dev ($fs)"
-                return 0
-            fi
+        for tdev in "/dev/$bname" \
+                    "/dev/${bname}1" "/dev/${bname}2" \
+                    "/dev/${bname}p1" "/dev/${bname}p2"; do
+            [ -b "$tdev" ] || continue
+            print_status "  try: $tdev"
+            for tfs in iso9660 udf vfat exfat ext4 ext3 ext2; do
+                if try_one "$tdev" "$tfs"; then
+                    PORTEUS_DIR="$SCAN_MNT/porteus"
+                    MEDIA_MNT="$SCAN_MNT"
+                    print_status "  FOUND: $tdev ($tfs)"
+                    return 0
+                fi
+            done
         done
     done
     return 1
@@ -701,14 +747,14 @@ scan_devices() {
 if [ -n "$FROM_PATH" ]; then
     case "$FROM_PATH" in
         /dev/*)
-            for fs in iso9660 udf vfat ext4 ext3 ext2; do
-                try_one "$FROM_PATH" "$fs" && {
+            for tfs in iso9660 udf vfat ext4 ext3 ext2; do
+                try_one "$FROM_PATH" "$tfs" && {
                     PORTEUS_DIR="$SCAN_MNT/porteus"
                     MEDIA_MNT="$SCAN_MNT"
                     break
                 }
             done ;;
-        *)  [ -d "$FROM_PATH/porteus/base" ] && PORTEUS_DIR="$FROM_PATH/porteus" ;;
+        *) [ -d "$FROM_PATH/porteus/base" ] && PORTEUS_DIR="$FROM_PATH/porteus" ;;
     esac
 fi
 
@@ -730,7 +776,6 @@ if [ "$COPY2RAM" = "1" ]; then
     sync
     [ -n "$MEDIA_MNT" ] && umount "$MEDIA_MNT" 2>/dev/null || true
     PORTEUS_DIR="/mnt/ram"
-    print_status "  ${SZ_MB}MB di RAM"
 fi
 
 # ── 8. Mount .xzm → OverlayFS ────────────────────────────────────────────────
@@ -739,33 +784,35 @@ mkdir -p /mnt/xzm /mnt/up /mnt/wk /mnt/new
 LOWER="" IDX=0
 
 mount_xzm() {
-    xzm_f="$1"
-    xzm_mpt="/mnt/xzm/$IDX"
-    mkdir -p "$xzm_mpt"
-    if mount -t squashfs -o loop,ro "$xzm_f" "$xzm_mpt" 2>/dev/null; then
-        print_status "  + $(basename "$xzm_f")"
-        if [ -z "$LOWER" ]; then LOWER="$xzm_mpt"
-        else LOWER="$LOWER:$xzm_mpt"; fi
+    xf="$1"
+    xmpt="/mnt/xzm/$IDX"
+    mkdir -p "$xmpt"
+    if mount -t squashfs -o loop,ro "$xf" "$xmpt" 2>/dev/null; then
+        xname="${xf##*/}"
+        print_status "  + $xname"
+        if [ -z "$LOWER" ]; then LOWER="$xmpt"
+        else LOWER="$LOWER:$xmpt"; fi
         IDX=$((IDX+1))
         return 0
     fi
-    warn "  gagal mount: $(basename "$xzm_f")"
+    xname="${xf##*/}"
+    warn "  gagal: $xname"
     return 1
 }
 
-for xzm in $(ls "$PORTEUS_DIR/base/"*.xzm 2>/dev/null | sort); do
-    mount_xzm "$xzm"
+for xzm in "$PORTEUS_DIR/base/"*.xzm; do
+    [ -f "$xzm" ] && mount_xzm "$xzm"
 done
-for xzm in $(ls "$PORTEUS_DIR/modules/"*.xzm 2>/dev/null | sort); do
-    mount_xzm "$xzm"
+for xzm in "$PORTEUS_DIR/modules/"*.xzm; do
+    [ -f "$xzm" ] && mount_xzm "$xzm"
 done
 for name in $LOAD_LIST; do
-    for f in "$PORTEUS_DIR/optional/$name" "$PORTEUS_DIR/optional/${name}.xzm"; do
-        [ -f "$f" ] && mount_xzm "$f" && break
+    for xf in "$PORTEUS_DIR/optional/$name" "$PORTEUS_DIR/optional/${name}.xzm"; do
+        [ -f "$xf" ] && mount_xzm "$xf" && break
     done
 done
 
-[ -n "$LOWER" ] || { warn "Tidak ada .xzm berhasil di-mount"; emergency_shell; }
+[ -n "$LOWER" ] || { warn "Tidak ada .xzm di-mount"; emergency_shell; }
 
 if [ "$NOMAGIC" = "1" ] || [ -z "$CHANGES_PATH" ]; then
     mount -t tmpfs tmpfs /mnt/up
@@ -780,17 +827,15 @@ mount -t overlay overlay \
     -o "lowerdir=$LOWER,upperdir=$UP_DIR,workdir=/mnt/wk" \
     /mnt/new \
     || { warn "OverlayFS gagal"; emergency_shell; }
-
 print_status "OverlayFS OK"
 
 # ── 9. GoboLinux System/Links ────────────────────────────────────────────────
 print_status "System/Links..."
-
 if [ -d /mnt/new/Programs ]; then
     for prog in /mnt/new/Programs/*/; do
         [ -d "$prog" ] || continue
-        prog_name=$(basename "$prog")
-        # Resolve versi
+        pname="${prog%/}"
+        pname="${pname##*/}"
         if [ -L "${prog}Current" ]; then
             ver=$(readlink -f "${prog}Current" 2>/dev/null)
         else
@@ -798,30 +843,28 @@ if [ -d /mnt/new/Programs ]; then
         fi
         [ -d "$ver" ] || continue
         [ -e "${prog}Current" ] || ln -snf "$ver" "${prog}Current" 2>/dev/null
-
         mkdir -p /mnt/new/System/Links/Executables \
                  /mnt/new/System/Links/Libraries
-
         for sub in bin sbin; do
             [ -d "$ver/$sub" ] || continue
-            for f in "$ver/$sub"/*; do
+            for f in "$ver/$sub/"*; do
                 [ -e "$f" ] || continue
-                dst="/mnt/new/System/Links/Executables/$(basename "$f")"
+                fname="${f##*/}"
+                dst="/mnt/new/System/Links/Executables/$fname"
                 [ -e "$dst" ] || ln -s "$f" "$dst" 2>/dev/null
             done
         done
         for sub in lib lib64; do
             [ -d "$ver/$sub" ] || continue
-            for f in "$ver/$sub"/*; do
+            for f in "$ver/$sub/"*; do
                 [ -e "$f" ] || continue
-                dst="/mnt/new/System/Links/Libraries/$(basename "$f")"
+                fname="${f##*/}"
+                dst="/mnt/new/System/Links/Libraries/$fname"
                 [ -e "$dst" ] || ln -s "$f" "$dst" 2>/dev/null
             done
         done
     done
 fi
-
-# FHS symlinks
 for pair in "bin:/System/Links/Executables" "sbin:/System/Links/Executables" \
             "lib:/System/Links/Libraries"   "lib64:/System/Links/Libraries"; do
     lnk="${pair%%:*}"; tgt="${pair#*:}"
@@ -831,7 +874,6 @@ done
 
 # ── 10. switch_root ──────────────────────────────────────────────────────────
 print_status "switch_root..."
-
 for fsinfo in "proc:proc:/proc" "sysfs:sysfs:/sys" "devtmpfs:dev:/dev" "tmpfs:tmpfs:/run"; do
     t="${fsinfo%%:*}"; rest="${fsinfo#*:}"; src="${rest%%:*}"; dst="${rest#*:}"
     mount -t "$t" "$src" "/mnt/new/$dst" 2>/dev/null || \
