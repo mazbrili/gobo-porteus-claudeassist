@@ -31,19 +31,25 @@
 # Penggunaan:
 #   sudo bash build-gobo-live.sh GoboLinux-017.01-x86_64.iso [output_dir]
 # ─────────────────────────────────────────────────────────────────────────────
+# Path untuk skrip pemetaan Current yang akan dihasilkan
+CURRENT_MAP_FILE="gobo17.01-current.sh"
 
 set -euo pipefail
 
 GOBO_ISO="${1:-GoboLinux-017.01-x86_64.iso}"
 OUTPUT_DIR="${2:-$(cd "$(dirname "$0")/.." && pwd)/output/porteus-gobolinux}"
 WORK_DIR="${TMPDIR:-/tmp}/gobo-live-$$"
+# gobo-root disimpan di luar WORK_DIR agar tidak ikut dihapus trap
+GOBO_ROOT_DIR="${TMPDIR:-/tmp}/gobo-live-root-$$"
+GOBO_ROOT_PERSIST=""
 COMP="${COMP:-xz}"
 BLOCK_SIZE="${BLOCK_SIZE:-256K}"
 
 G='\033[0;32m' Y='\033[1;33m' R='\033[0;31m' C='\033[0;36m' N='\033[0m'
-log()  { echo -e "${G}[$(date +%H:%M:%S)]${N} $*"; }
-info() { echo -e "${C}  ↳${N} $*"; }
-warn() { echo -e "${Y}[WARN]${N} $*"; }
+# Semua output ke stderr agar tidak kontaminasi $() subshell capture
+log()  { echo -e "${G}[$(date +%H:%M:%S)]${N} $*" >&2; }
+info() { echo -e "${C}  ↳${N} $*" >&2; }
+warn() { echo -e "${Y}[WARN]${N} $*" >&2; }
 die()  { echo -e "${R}[ERROR]${N} $*" >&2; exit 1; }
 
 # ── Dependensi ────────────────────────────────────────────────────────────────
@@ -65,48 +71,63 @@ scan_iso() {
     mkdir -p "$WORK_DIR/iso"
     mount -o loop,ro "$GOBO_ISO" "$WORK_DIR/iso"
 
-    echo ""
-    echo "╔═══════════════════════════════════════════════════════════╗"
-    echo "║         ISI ISO GoboLinux (semua file, 3 level)           ║"
-    echo "╚═══════════════════════════════════════════════════════════╝"
+    log ""
+    log "╔═══════════════════════════════════════════════════════════╗"
+    log "║         ISI ISO GoboLinux (semua file, 3 level)           ║"
+    log "╚═══════════════════════════════════════════════════════════╝"
     find "$WORK_DIR/iso" -maxdepth 3 | sort | while read -r f; do
         local rel="${f#$WORK_DIR/iso}"
         [ -z "$rel" ] && continue
         if [ -d "$f" ]; then
-            echo "  📁 $rel/"
+            log "  DIR  $rel/"
         else
-            local sz
+            local sz fmt
             sz=$(du -sh "$f" 2>/dev/null | cut -f1)
-            local fmt
             fmt=$(file -b "$f" 2>/dev/null | cut -c1-45)
-            printf "  📄 %-40s [%6s]  %s\n" "$rel" "$sz" "$fmt"
+            log "  FILE $rel [$sz] $fmt"
         fi
     done
-    echo ""
+    log ""
 }
 
 # ── Deteksi kernel ─────────────────────────────────────────────────────────────
 detect_kernel() {
     local found=""
-    # Scan semua file, cek magic bytes
-    while IFS= read -r -d '' f; do
-        local magic
-        magic=$(file -b "$f" 2>/dev/null)
-        if echo "$magic" | grep -qiE "Linux kernel|bzImage|x86 boot sector|ELF.*executable"; then
-            found="$f"; break
-        fi
-    done < <(find "$WORK_DIR/iso" -not -type d -print0 | sort -z)
 
-    # Fallback: nama file umum
+    # Prioritas 1: nama file yang pasti dari GoboLinux isolinux/
+    # Ini lebih reliable daripada scan ELF (bisa salah ambil file lain)
+    for candidate in \
+        "$WORK_DIR/iso/isolinux/kernel" \
+        "$WORK_DIR/iso/boot/isolinux/kernel" \
+        "$WORK_DIR/iso/isolinux/vmlinuz" \
+        "$WORK_DIR/iso/boot/isolinux/vmlinuz" \
+        "$WORK_DIR/iso/boot/vmlinuz"
+    do
+        [ -f "$candidate" ] || continue
+        local sz; sz=$(stat -c%s "$candidate" 2>/dev/null || echo 0)
+        # Kernel Linux minimal ~1MB, skip file kecil
+        if [ "$sz" -gt 1048576 ]; then
+            found="$candidate"
+            info "Kernel ditemukan via nama: $candidate ($(du -sh "$candidate" | cut -f1))"
+            break
+        fi
+    done
+
+    # Prioritas 2: scan ELF — cari file TERBESAR yang match
+    # (kernel selalu file terbesar di isolinux/)
     if [ -z "$found" ]; then
-        for candidate in \
-            "$WORK_DIR/iso/isolinux/kernel" \
-            "$WORK_DIR/iso/boot/isolinux/kernel" \
-            "$WORK_DIR/iso/isolinux/vmlinuz" \
-            "$WORK_DIR/iso/boot/vmlinuz"
-        do
-            [ -f "$candidate" ] && { found="$candidate"; break; }
-        done
+        local biggest_size=0
+        while IFS= read -r -d '' f; do
+            local magic sz
+            magic=$(file -b "$f" 2>/dev/null)
+            echo "$magic" | grep -qiE "Linux kernel|bzImage|x86 boot" || continue
+            sz=$(stat -c%s "$f" 2>/dev/null || echo 0)
+            if [ "$sz" -gt "$biggest_size" ]; then
+                biggest_size="$sz"
+                found="$f"
+            fi
+        done < <(find "$WORK_DIR/iso" -not -type d -print0)
+        [ -n "$found" ] && info "Kernel ditemukan via scan: $found ($(du -sh "$found" | cut -f1))"
     fi
 
     echo "$found"
@@ -220,15 +241,55 @@ extract_squashfs() {
     info "Ukuran: $(du -sh "$sqfs" | cut -f1)"
     info "Ini bisa memakan waktu beberapa menit..."
 
-    mkdir -p "$WORK_DIR/gobo-root"
-    unsquashfs -d "$WORK_DIR/gobo-root" "$sqfs" || \
+    # Ekstrak langsung ke GOBO_ROOT_DIR (di luar WORK_DIR, tidak ikut trap rm)
+    # Ini menghindari mv antar filesystem (masalah WSL /tmp vs /mnt/c NTFS)
+    rm -rf "$GOBO_ROOT_DIR"
+    unsquashfs -d "$GOBO_ROOT_DIR" "$sqfs" || \
         die "Gagal ekstrak squashfs.
     Jika error 'zstd not supported', install squashfs-tools >= 4.5:
       sudo apt install squashfs-tools
     Atau build dari source: https://github.com/plougher/squashfs-tools"
 
     log "Root GoboLinux berhasil diekstrak:"
-    ls -la "$WORK_DIR/gobo-root/" | head -15
+    ls -la "$GOBO_ROOT_DIR/" | head -15
+
+    # Buat symlink WORK_DIR/gobo-root -> GOBO_ROOT_DIR
+    # agar semua fungsi build_xxx() yang pakai $WORK_DIR/gobo-root tetap bekerja
+    ln -snf "$GOBO_ROOT_DIR" "$WORK_DIR/gobo-root"
+
+    GOBO_ROOT_PERSIST="$GOBO_ROOT_DIR"
+    log "gobo-root di: $GOBO_ROOT_DIR ($(du -sh "$GOBO_ROOT_DIR" | cut -f1))"
+
+    # ── Validasi: pastikan ini GoboLinux 017 (kernel 6.x), bukan 016 ──────────
+    log "Validasi versi kernel di gobo-root..."
+    if [ -d "$GOBO_ROOT_DIR/Programs/Linux" ]; then
+        log "  Isi Programs/Linux/:"
+        ls "$GOBO_ROOT_DIR/Programs/Linux/" | while read -r k; do
+            log "    $k"
+        done
+        local kver
+        kver=$(ls "$GOBO_ROOT_DIR/Programs/Linux/" | grep -v Current | sort -V | tail -1)
+        log "  Kernel versi: $kver"
+        # Cek apakah kernel 6.x
+        case "$kver" in
+            6.*)
+                log "  OK: GoboLinux 017 kernel ($kver)" ;;
+            5.*|4.*|3.*)
+                warn "  PERHATIAN: Kernel $kver terdeteksi — ini sepertinya GoboLinux 016!"
+                warn "  Pastikan ISO yang digunakan adalah GoboLinux-017.01-x86_64.iso"
+                warn "  gobo-root ini TIDAK akan menghasilkan initrd yang benar" ;;
+            *)
+                warn "  Kernel versi tidak dikenal: $kver" ;;
+        esac
+    else
+        warn "  Programs/Linux tidak ada di gobo-root — squashfs mungkin salah"
+    fi
+
+    # Simpan path gobo-root ke file agar Makefile/build-initrd.sh bisa menemukannya
+    mkdir -p "$(dirname "$OUTPUT_DIR")"
+    echo "$GOBO_ROOT_DIR" > "$(dirname "$OUTPUT_DIR")/.gobo-root-path"
+    log "Path gobo-root: $GOBO_ROOT_DIR"
+    log "Path file    : $(dirname "$OUTPUT_DIR")/.gobo-root-path"
 }
 
 # ── make_xzm ─────────────────────────────────────────────────────────────────
@@ -253,6 +314,52 @@ make_xzm() {
     info "→ $(du -sh "$out" | cut -f1)  $out"
 }
 
+# ── Fungsi Helper Rsync (Perbaikan) ──────────────────────────────────────────
+# Fungsi ini memastikan hanya file yang diperlukan yang masuk ke modul.
+# $1 = Path asal (/mnt/gobo-root/Programs/NamaApp)
+# $2 = Path tujuan staging
+# $3 = Mode (runtime / dev)
+sync_gobo_program() {
+    local src="$1"
+    local dest="$2"
+    local mode="${3:-runtime}"
+
+    if [ "$mode" == "dev" ]; then
+        # Mode Dev: Masukkan Include, Lib/pkgconfig, dan Static Libs
+        rsync -ah --prune-empty-dirs \
+            --include='*/' \
+            --include='Current/***' \
+            --include='*/include/***' \
+            --include='*/lib/pkgconfig/***' \
+            --include='*/lib/*.a' \
+            --include='*/lib/*.la' \
+            --include='*/share/aclocal/***' \
+            --include='*/bin/***' \
+            --include='*/sbin/***' \
+            --include='*/lib/***' \
+            --include='*/libexec/***' \
+            --exclude='*' \
+            "$src" "$dest"
+    else
+        # Mode Runtime: Logika filter rsync Anda (Tanpa Headers/Docs)
+        rsync -ah --prune-empty-dirs \
+            --include='*/' \
+            --include='Current/***' \
+            --include='*/bin/***' \
+            --include='*/sbin/***' \
+            --include='*/lib/***' \
+            --include='*/libexec/***' \
+            --include='*/share/icons/***' \
+            --include='*/share/fonts/***' \
+            --include='*/share/X11/***' \
+            --exclude='*/include' \
+            --exclude='*/share/doc' \
+            --exclude='*/share/man' \
+            --exclude='*/share/info' \
+            --exclude='*' \
+            "$src" "$dest"
+    fi
+}
 # ── 000-kernel.xzm ────────────────────────────────────────────────────────────
 build_000_kernel() {
     log "=== 000-kernel.xzm ==="
@@ -303,38 +410,28 @@ BASE_PROGS=(
     Udev Eudev Acpid Dbus Linux-PAM Sysfsutils Psmisc
 )
 
+# ── Refaktor Fungsi Build (Contoh 001-base) ──────────────────────────────────
 build_001_base() {
-    log "=== 001-base.xzm ==="
+    log "=== 001-base.xzm (Optimized with Rsync) ==="
     local staging="$WORK_DIR/staging/001-base"
     mkdir -p "$staging/Programs"
 
-    local count=0
     for prog in "${BASE_PROGS[@]}"; do
         local src="$WORK_DIR/gobo-root/Programs/$prog"
         [ -d "$src" ] || continue
-        cp -a "$src" "$staging/Programs/"
-        info "+ $prog"
-        count=$((count + 1))
+        info "+ $prog (runtime)"
+        sync_gobo_program "$src" "$staging/Programs/" "runtime"
     done
-    [ "$count" -eq 0 ] && warn "Tidak ada program base ditemukan di Programs/"
-
-    # System/ (kecuali Kernel)
-    if [ -d "$WORK_DIR/gobo-root/System" ]; then
+    
+    # Salin System Files (Settings, dsb tetap pakai cp -a karena krusial)
+    [ -d "$WORK_DIR/gobo-root/System" ] && {
         mkdir -p "$staging/System"
-        for d in Links Settings Environment; do
-            [ -d "$WORK_DIR/gobo-root/System/$d" ] && \
-                cp -a "$WORK_DIR/gobo-root/System/$d" "$staging/System/"
-        done
-    fi
-
-    for d in Users Data Mount; do
-        [ -d "$WORK_DIR/gobo-root/$d" ] && cp -a "$WORK_DIR/gobo-root/$d" "$staging/"
-    done
-
-    for d in proc sys dev tmp run; do mkdir -p "$staging/$d"; done
-
+        cp -a "$WORK_DIR/gobo-root/System/Settings" "$staging/System/"
+        cp -a "$WORK_DIR/gobo-root/System/Links" "$staging/System/"
+    }
+    
     make_xzm "$staging" "$OUTPUT_DIR/porteus/base/001-base.xzm" "001-base.xzm"
-}
+}	
 
 # ── 002-gobo-tools.xzm ────────────────────────────────────────────────────────
 TOOLS_PROGS=(
@@ -419,7 +516,35 @@ build_004_desktop() {
 
     make_xzm "$staging" "$OUTPUT_DIR/porteus/base/004-desktop.xzm" "004-desktop.xzm"
 }
+# ── 005-dev.xzm ───────────────────────────────────────────────────────────
+# ── List Program Modul 005-dev ────────────────────────────────────────────────
+DEV_PROGS=(
+    Gcc Binutils Make M4 Bison Flex
+    Autoconf Automake Libtool Pkg-Config
+    Linux-Lib-Headers Glibc-Headers
+    Python-Headers # Jika ada di Gobo
+)
+build_005_dev() {
+    log "=== 005-dev.xzm (Development Tools) ==="
+    local staging="$WORK_DIR/staging/005-dev"
+    mkdir -p "$staging/Programs"
 
+    local count=0
+    for prog in "${DEV_PROGS[@]}"; do
+        local src="$WORK_DIR/gobo-root/Programs/$prog"
+        [ -d "$src" ] || continue
+        info "+ $prog (dev/full)"
+        sync_gobo_program "$src" "$staging/Programs/" "dev"
+        count=$((count + 1))
+    done
+    
+    # Tambahkan symlink linker untuk dev
+    if [ "$count" -gt 0 ]; then
+        make_xzm "$staging" "$OUTPUT_DIR/porteus/optional/005-dev.xzm" "005-dev.xzm"
+    else
+        warn "Modul dev kosong, tidak dibuat."
+    fi
+}
 # ── porteus.cfg & grub.cfg ─────────────────────────────────────────────────────
 create_boot_config() {
     log "Membuat porteus.cfg dan grub.cfg..."
@@ -510,10 +635,11 @@ show_summary() {
     echo ""
     echo "LANGKAH BERIKUTNYA:"
     echo ""
-    echo "1. Modifikasi initrd (WAJIB sebelum boot):"
-    echo "   sudo bash scripts/modify-initrd.sh \\"
-    echo "     $OUTPUT_DIR/boot/syslinux/initrd-gobo-orig \\"
-    echo "     $OUTPUT_DIR/boot/syslinux/initrd.xz"
+    echo "1. Build initrd baru (WAJIB sebelum boot):"
+    echo "   sudo bash scripts/build-initrd.sh \\"
+    echo "     --slax /path/to/slax.iso \\"
+    echo "     --gobo017root $(dirname "$OUTPUT_DIR")/gobo-root \\"
+    echo "     --output $OUTPUT_DIR/boot/syslinux/initrd.xz"
     echo ""
     echo "2a. Install ke USB:"
     echo "    sudo bash scripts/install-deploy.sh usb /dev/sdX"
@@ -532,6 +658,7 @@ main() {
     log "Kompresi modul: $COMP | Block: $BLOCK_SIZE"
 
     trap 'umount "$WORK_DIR/iso" 2>/dev/null || true; rm -rf "$WORK_DIR"' EXIT
+    # GOBO_ROOT_DIR tidak dihapus trap — dibutuhkan oleh build-initrd.sh
     mkdir -p "$WORK_DIR"
 
     mkdir -p \
@@ -573,7 +700,7 @@ main() {
     build_002_tools
     build_003_xorg
     build_004_desktop
-
+    build_005_dev
     # 6. Buat konfigurasi bootloader
     create_boot_config
 
