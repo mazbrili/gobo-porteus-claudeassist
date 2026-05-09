@@ -55,7 +55,7 @@ die()  { echo -e "${R}[ERROR]${N} $*" >&2; exit 1; }
 # ── Dependensi ────────────────────────────────────────────────────────────────
 check_deps() {
     local miss=()
-    for cmd in mksquashfs unsquashfs file; do
+    for cmd in mksquashfs unsquashfs file rsync; do
         command -v "$cmd" &>/dev/null || miss+=("$cmd")
     done
     [ ${#miss[@]} -eq 0 ] || die "Tidak ada: ${miss[*]}
@@ -422,9 +422,12 @@ build_001_base() {
     done
 
     # Masukkan skrip pemetaan Current ke lokasi inisialisasi
+    # Script ini akan dieksekusi oleh /init setelah overlay mount
+    # (lihat build-initrd.sh bagian System/Links — dipanggil sebelum switch_root)
     local init_dir="$staging/System/Settings/BootScripts"
     mkdir -p "$init_dir"
     cp "$WORK_DIR/$CURRENT_MAP_FILE" "$init_dir/InitializeCurrent"
+    chmod +x "$staging/System/Settings/BootScripts/InitializeCurrent"
     
     # Salin System Files esensial lainnya
     cp -a "$WORK_DIR/gobo-root/System/Settings/." "$staging/System/Settings/" 2>/dev/null || true
@@ -448,7 +451,7 @@ build_002_tools() {
     for prog in "${TOOLS_PROGS[@]}"; do
         local src="$WORK_DIR/gobo-root/Programs/$prog"
         [ -d "$src" ] || continue
-        cp -a "$src" "$staging/Programs/"
+        sync_gobo_program "$src" "$staging/Programs/" "runtime"
         info "+ $prog"
         count=$((count + 1))
     done
@@ -477,7 +480,7 @@ build_003_xorg() {
     for prog in "${XORG_PROGS[@]}"; do
         local src="$WORK_DIR/gobo-root/Programs/$prog"
         [ -d "$src" ] || continue
-        cp -a "$src" "$staging/Programs/"
+        sync_gobo_program "$src" "$staging/Programs/" "runtime"
         info "+ $prog"
         count=$((count + 1))
     done
@@ -507,7 +510,7 @@ build_004_desktop() {
     for prog in "${DESKTOP_PROGS[@]}"; do
         local src="$WORK_DIR/gobo-root/Programs/$prog"
         [ -d "$src" ] || continue
-        cp -a "$src" "$staging/Programs/"
+        sync_gobo_program "$src" "$staging/Programs/" "runtime"
         info "+ $prog"
         count=$((count + 1))
     done
@@ -517,11 +520,12 @@ build_004_desktop() {
 }
 # ── 005-dev.xzm ───────────────────────────────────────────────────────────
 # ── List Program Modul 005-dev ────────────────────────────────────────────────
+# Nama program harus sesuai dengan nama di Programs/ GoboLinux 017
 DEV_PROGS=(
     Gcc Binutils Make M4 Bison Flex
-    Autoconf Automake Libtool Pkg-Config
-    Linux-Lib-Headers Glibc-Headers
-    Python-Headers # Jika ada di Gobo
+    Autoconf Automake Libtool Pkg-config
+    Linux-Headers
+    Python3
 )
 build_005_dev() {
     log "=== 005-dev.xzm (Development Tools) ==="
@@ -661,8 +665,7 @@ show_summary() {
     echo ""
     echo "1. Build initrd baru (WAJIB sebelum boot):"
     echo "   sudo bash scripts/build-initrd.sh \\"
-    echo "     --slax /path/to/slax.iso \\"
-    echo "     --gobo017root $(dirname "$OUTPUT_DIR")/gobo-root \\"
+    echo "     --gobo017initrd $OUTPUT_DIR/boot/syslinux/initrd-gobo-orig \\"
     echo "     --output $OUTPUT_DIR/boot/syslinux/initrd.xz"
     echo ""
     echo "2a. Install ke USB:"
