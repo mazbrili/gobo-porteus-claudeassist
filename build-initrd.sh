@@ -2,56 +2,49 @@
 # build-initrd.sh
 # ─────────────────────────────────────────────────────────────────────────────
 # Membangun initramfs untuk GoboLinux 017 Live (Porteus-style)
-# dengan mengambil inspirasi dari dua sumber:
 #
-#   1. GoboLinux 016 initrd  — formatnya CramFS, berisi:
-#        - BusyBox statik
-#        - InitRDScripts (startGoboLinux, dll)
-#        - Mini GoboLinux environment (Programs/Bash, Scripts, dll)
-#      Script startGoboLinux-nya yang kita pelajari strukturnya,
-#      lalu kita tulis ulang untuk mendukung .xzm Porteus-style.
+# STRATEGI BARU (berdasarkan temuan):
+#   GoboLinux 017 initramfs bisa diekstrak dengan unmkinitramfs dan berisi:
+#     early/  — microcode AMD/Intel
+#     main/   — filesystem lengkap termasuk:
+#               Programs/Linux/6.12.16/lib/modules/6.12.16-Gobo/kernel/
+#               bin/busybox, sbin/*, lib/*, dll
 #
-#   2. Slax initramfs  — berisi hanya satu binary: busybox statik
-#      (dikompilasi terhadap uClibc/musl, sangat kecil ~1MB)
-#      Ini yang kita pakai sebagai /bin/busybox di initrd baru kita.
+#   Kita GUNAKAN main/ dari initramfs GoboLinux 017 sebagai base,
+#   lalu GANTI /init-nya dengan init kita yang mount .xzm Porteus-style.
+#   BusyBox dan semua modul kernel sudah ada di dalamnya.
 #
-# HASIL:
-#   initrd.xz = cpio.xz berisi:
-#     /bin/busybox          ← dari Slax ISO
-#     /bin/<applet symlinks>
-#     /init                 ← script terinspirasi GoboLinux 016 startGoboLinux
-#                             + diextend untuk mount .xzm Porteus-style
-#     /etc/             skeleton minimal
-#     /dev/             device nodes
-#     /mnt/             mount points
-#
-# Penggunaan:
+# Usage:
 #   sudo bash build-initrd.sh \
-#       --gobo016  GoboLinux-016.01-x86_64.iso \
-#       --slax     slax-*.iso \
-#       --gobo017root /path/to/gobo017-unsquashed \
-#       --output   /path/to/output/initrd.xz
+#     --gobo017initrd /path/to/initramfs-gobo-orig \
+#     --output        /path/to/initrd.xz
 #
-# Jika --gobo016 tidak ada, script akan mengekstrak BusyBox dari --slax saja
-# dan menulis /init dari nol (terinspirasi logika GoboLinux 016).
+# Optional:
+#   --gobo016  GoboLinux-016.iso  (tidak lagi diperlukan)
+#   --slax     slax.iso           (tidak lagi diperlukan, BusyBox dari GoboLinux)
+#   --gobo017root /path           (tidak lagi diperlukan)
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
 
 # ── Parse argumen ─────────────────────────────────────────────────────────────
+GOBO017_INITRD=""
+OUTPUT_INITRD=""
+# Argumen lama tetap diterima tapi diabaikan (backward compat)
 GOBO016_ISO=""
 SLAX_ISO=""
 GOBO017_ROOT=""
-OUTPUT_INITRD=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --gobo016)     GOBO016_ISO="$2";   shift 2 ;;
-        --slax)        SLAX_ISO="$2";      shift 2 ;;
-        --gobo017root) GOBO017_ROOT="$2";  shift 2 ;;
-        --output)      OUTPUT_INITRD="$2"; shift 2 ;;
+        --gobo017initrd) GOBO017_INITRD="$2"; shift 2 ;;
+        --output)        OUTPUT_INITRD="$2";  shift 2 ;;
+        # Backward compat — diabaikan
+        --gobo016)       GOBO016_ISO="$2";    shift 2 ;;
+        --slax)          SLAX_ISO="$2";       shift 2 ;;
+        --gobo017root)   GOBO017_ROOT="$2";   shift 2 ;;
         -h|--help)
-            sed -n '3,40p' "$0" | grep '^#' | sed 's/^# \?//'
+            sed -n '3,30p' "$0" | sed 's/^# \?//'
             exit 0 ;;
         *) echo "Argumen tidak dikenal: $1"; exit 1 ;;
     esac
@@ -61,205 +54,229 @@ done
 [ "$(id -u)" = "0" ]    || { echo "ERROR: harus root (sudo)"; exit 1; }
 
 WORK="$(mktemp -d /tmp/gobo-initrd-XXXXXX)"
-trap 'cleanup' EXIT
-
-cleanup() {
-    # Umount semua yang masih ter-mount di WORK
-    for mnt in "$WORK"/mnt-*; do
-        umount "$mnt" 2>/dev/null || true
-    done
-    rm -rf "$WORK"
-}
+trap 'rm -rf "$WORK"' EXIT
 
 G='\033[0;32m' Y='\033[1;33m' R='\033[0;31m' C='\033[0;36m' N='\033[0m'
-log()  { echo -e "${G}[$(date +%H:%M:%S)]${N} $*"; }
-info() { echo -e "${C}  ↳${N} $*"; }
-warn() { echo -e "${Y}[WARN]${N} $*"; }
+# Semua log ke stderr agar tidak mengganggu $() capture return value
+log()  { echo -e "${G}[$(date +%H:%M:%S)]${N} $*" >&2; }
+info() { echo -e "${C}  ↳${N} $*" >&2; }
+warn() { echo -e "${Y}[WARN]${N} $*" >&2; }
 die()  { echo -e "${R}[ERROR]${N} $*" >&2; exit 1; }
 
 INITRD_DIR="$WORK/initrd"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TAHAP 1: Cari BusyBox dari Slax ISO
-# Slax menyimpan busybox statik langsung di dalam initramfs-nya
-# Format: cpio.xz (Slax 9+) atau cpio.gz (Slax lama)
+# TAHAP 1: Temukan initramfs GoboLinux 017
+# Cari dari: --gobo017initrd, atau dari output build-gobo-live.sh
 # ─────────────────────────────────────────────────────────────────────────────
-extract_busybox_from_slax() {
-    log "Mengekstrak BusyBox dari Slax..."
-    [ -f "$SLAX_ISO" ] || die "Slax ISO tidak ditemukan: $SLAX_ISO"
+find_gobo017_initrd() {
+    log "=== Cari initramfs GoboLinux 017 ==="
 
-    local slax_mnt="$WORK/mnt-slax"
-    mkdir -p "$slax_mnt"
-    mount -o loop,ro "$SLAX_ISO" "$slax_mnt"
-    info "Slax ISO di-mount: $slax_mnt"
-
-    # Tampilkan isi ISO Slax
-    info "Isi Slax ISO:"
-    find "$slax_mnt" -maxdepth 3 | sort | while read -r f; do
-        [ -d "$f" ] && continue
-        local sz; sz=$(du -sh "$f" 2>/dev/null | cut -f1)
-        echo "    $sz  ${f#$slax_mnt/}"
-    done
-
-    # Cari initramfs Slax
-    # Slax 9+: /slax/boot/initrfs.img  atau  /boot/initrd.img
-    local slax_initrd=""
-    for candidate in \
-        "$slax_mnt/slax/boot/initrfs.img" \
-        "$slax_mnt/slax/boot/initrd.img" \
-        "$slax_mnt/boot/initrd.img" \
-        "$slax_mnt/boot/initramfs.img" \
-        "$slax_mnt/boot/initrfs.img"
-    do
-        [ -f "$candidate" ] && { slax_initrd="$candidate"; break; }
-    done
-
-    # Fallback: cari file cpio apapun
-    if [ -z "$slax_initrd" ]; then
-        slax_initrd=$(find "$slax_mnt" -not -type d | while read -r f; do
-            file -b "$f" | grep -qi "cpio\|gzip\|XZ\|Zstandard" && echo "$f" && break
-        done | head -1)
-    fi
-
-    [ -n "$slax_initrd" ] || die "Initramfs Slax tidak ditemukan dalam ISO"
-    info "Initramfs Slax: ${slax_initrd#$slax_mnt/}"
-    info "Format: $(file -b "$slax_initrd" | cut -c1-60)"
-
-    # Ekstrak initramfs Slax ke tmp dir
-    local slax_initrd_dir="$WORK/slax-initrd"
-    mkdir -p "$slax_initrd_dir"
-    cd "$slax_initrd_dir"
-
-    local fmt; fmt=$(file -b "$slax_initrd")
-    if echo "$fmt" | grep -qi "XZ"; then
-        xzcat "$slax_initrd" | cpio -id --quiet 2>/dev/null
-    elif echo "$fmt" | grep -qi "gzip"; then
-        zcat "$slax_initrd" | cpio -id --quiet 2>/dev/null
-    elif echo "$fmt" | grep -qi "Zstandard"; then
-        zstdcat "$slax_initrd" | cpio -id --quiet 2>/dev/null
-    else
-        # Coba semua
-        xzcat   "$slax_initrd" 2>/dev/null | cpio -id --quiet 2>/dev/null || \
-        zcat    "$slax_initrd" 2>/dev/null | cpio -id --quiet 2>/dev/null || \
-        zstdcat "$slax_initrd" 2>/dev/null | cpio -id --quiet 2>/dev/null || \
-        die "Tidak bisa mengekstrak initramfs Slax"
-    fi
-    cd - >/dev/null
-
-    while read -r f; do
-
-    echo " ${f#$slax_initrd_dir/}"
-    done < <(find "$slax_initrd_dir" -not -type d | head -20)
-
-
-    # Cari binary busybox
-    local bb=""
-    for candidate in \
-        "$slax_initrd_dir/bin/busybox" \
-        "$slax_initrd_dir/busybox" \
-        "$slax_initrd_dir/usr/bin/busybox"
-    do
-        [ -f "$candidate" ] && { bb="$candidate"; break; }
-    done
-
-    # Fallback: cari binary ELF statik apapun yang namanya busybox
-    if [ -z "$bb" ]; then
-        bb=$(find "$slax_initrd_dir" -name "busybox" 2>/dev/null | head -1)
-    fi
-
-    [ -n "$bb" ] || die "BusyBox tidak ditemukan dalam initramfs Slax"
-
-    info "BusyBox ditemukan: ${bb#$slax_initrd_dir/}"
-    info "Format: $(file -b "$bb" | cut -c1-60)"
-    info "Ukuran: $(du -sh "$bb" | cut -f1)"
-
-    # Salin ke WORK untuk digunakan
-    cp "$bb" "$WORK/busybox"
-    chmod +x "$WORK/busybox"
-
-    umount "$slax_mnt"
-    log "BusyBox dari Slax berhasil diekstrak"
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TAHAP 2: Ambil struktur init dari GoboLinux 016 initrd (CramFS)
-# Format: mkfs.cramfs -> perlu mount sebagai loop dengan filesystem cramfs
-# ─────────────────────────────────────────────────────────────────────────────
-extract_gobo016_initrd_structure() {
-    log "Membaca struktur GoboLinux 016 initrd..."
-    [ -f "$GOBO016_ISO" ] || { warn "GoboLinux 016 ISO tidak ada: $GOBO016_ISO"; return 0; }
-
-    local gobo16_mnt="$WORK/mnt-gobo016"
-    local cramfs_mnt="$WORK/mnt-cramfs"
-    mkdir -p "$gobo16_mnt" "$cramfs_mnt"
-
-    mount -o loop,ro "$GOBO016_ISO" "$gobo16_mnt"
-    info "GoboLinux 016 ISO di-mount"
-
-    # Cari initrd di ISO GoboLinux 016
-    # Format: isolinux/initrd (CramFS)
-    local initrd016=""
-    for candidate in \
-        "$gobo16_mnt/isolinux/initrd" \
-        "$gobo16_mnt/boot/isolinux/initrd" \
-        "$gobo16_mnt/isolinux/initrd.img"
-    do
-        [ -f "$candidate" ] && { initrd016="$candidate"; break; }
-    done
-
-    if [ -z "$initrd016" ]; then
-        # Scan: cari file CramFS
-        initrd016=$(find "$gobo16_mnt" -not -type d | while read -r f; do
-            file -b "$f" | grep -qi "CramFS\|Linux.*cramfs" && echo "$f" && break
-        done | head -1)
-    fi
-
-    if [ -z "$initrd016" ]; then
-        warn "initrd GoboLinux 016 tidak ditemukan — akan tulis /init dari nol"
-        umount "$gobo16_mnt"
+    # Dari argumen eksplisit
+    if [ -n "$GOBO017_INITRD" ]; then
+        [ -f "$GOBO017_INITRD" ] || die "File tidak ada: $GOBO017_INITRD"
+        info "Dari argumen: $GOBO017_INITRD"
+        echo "$GOBO017_INITRD"
         return 0
     fi
 
-    info "GoboLinux 016 initrd: ${initrd016#$gobo16_mnt/}"
-    info "Format: $(file -b "$initrd016")"
+    # Cari dari output build-gobo-live.sh
+    local output_boot
+    output_boot="$(dirname "$OUTPUT_INITRD")"
 
-    # Mount CramFS
-    if mount -t cramfs -o loop,ro "$initrd016" "$cramfs_mnt" 2>/dev/null; then
-        info "CramFS ter-mount di $cramfs_mnt"
-        info "Isi GoboLinux 016 initrd:"
-        while read -r f; do
-        echo " ${f#$cramfs_mnt/}"
-        done < <(find "$cramfs_mnt" -not -type d | head -40)
-        # Salin semua isi initrd 016 ke referensi
-        cp -a "$cramfs_mnt/." "$WORK/gobo016-initrd/" 2>/dev/null || true
-        umount "$cramfs_mnt"
-    else
-        # CramFS tidak bisa di-mount langsung, coba ekstrak sebagai cpio
-        warn "Mount CramFS gagal — coba ekstrak alternatif"
-        cd "$WORK" && mkdir -p gobo016-initrd
-        zcat "$initrd016" 2>/dev/null | cpio -id --quiet -D gobo016-initrd 2>/dev/null || \
-        xzcat "$initrd016" 2>/dev/null | cpio -id --quiet -D gobo016-initrd 2>/dev/null || true
-        cd - >/dev/null
+    local candidates=(
+        "$output_boot/initrd-gobo-orig"
+        "$output_boot/initrd-gobo-orig.xz"
+        "$output_boot/initramfs"
+        "$output_boot/../../../boot/syslinux/initrd-gobo-orig"
+    )
+
+    log "  Mencari di:"
+    for f in "${candidates[@]}"; do
+        log "    $f — $([ -f "$f" ] && echo ADA || echo tidak ada)"
+        if [ -f "$f" ]; then
+            info "Ditemukan: $f"
+            echo "$f"
+            return 0
+        fi
+    done
+
+    # Scan seluruh output dir untuk file yang mirip initramfs
+    log "  Scan output dir untuk file initramfs..."
+    local found_scan
+    found_scan=$(find "$output_boot" -maxdepth 2 \
+        \( -name "initrd*" -o -name "initramfs*" \) \
+        -not -name "*.xz" -not -name "*.gz" 2>/dev/null | head -1)
+    if [ -z "$found_scan" ]; then
+        found_scan=$(find "$output_boot" -maxdepth 2 \
+            \( -name "initrd*" -o -name "initramfs*" \) \
+            2>/dev/null | head -1)
+    fi
+    if [ -n "$found_scan" ]; then
+        info "Ditemukan via scan: $found_scan"
+        echo "$found_scan"
+        return 0
     fi
 
-    umount "$gobo16_mnt"
-    log "Referensi GoboLinux 016 initrd selesai"
+    die "initramfs GoboLinux 017 tidak ditemukan!
+
+Solusi:
+  1. Pastikan sudah menjalankan: sudo make build
+  2. Atau gunakan argumen eksplisit:
+     sudo bash build-initrd.sh \
+       --gobo017initrd /path/ke/initramfs-dari-iso-gobolinux017 \
+       --output $OUTPUT_INITRD
+
+Lokasi yang dicari: ${candidates[*]}"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TAHAP 3: Bangun skeleton initramfs
+# TAHAP 2: Ekstrak initramfs GoboLinux 017 dengan unmkinitramfs
+# Menghasilkan: early/ dan main/
 # ─────────────────────────────────────────────────────────────────────────────
-build_skeleton() {
-    log "Membangun skeleton initramfs..."
-    mkdir -p "$INITRD_DIR"
+extract_gobo017_initrd() {
+    local initrd_file="$1"
+    log "=== Ekstrak initramfs GoboLinux 017 ==="
+    info "File: $initrd_file"
+    info "Format: $(file -b "$initrd_file" | cut -c1-60)"
+    info "Ukuran: $(du -sh "$initrd_file" | cut -f1)"
 
-    # Hierarki direktori
+    local extract_dir="$WORK/gobo017-initrd"
+    mkdir -p "$extract_dir"
+
+    # unmkinitramfs adalah tool standar dari initramfs-tools
+    if command -v unmkinitramfs &>/dev/null; then
+        log "  Menggunakan unmkinitramfs..."
+        unmkinitramfs "$initrd_file" "$extract_dir" 2>&1 | \
+            while read -r l; do info "$l"; done
+    else
+        warn "unmkinitramfs tidak ada — install: apt install initramfs-tools"
+        warn "Mencoba ekstrak manual..."
+
+        # Coba split early_cpio + main cpio manual
+        # Format: [early cpio tidak terkompresi] + [main cpio terkompresi]
+        local fmt; fmt=$(file -b "$initrd_file")
+
+        mkdir -p "$extract_dir/main"
+
+        if echo "$fmt" | grep -qi "Zstandard"; then
+            # GoboLinux 017: zstd
+            if command -v zstd &>/dev/null; then
+                # Skip early_cpio (cari offset zstd magic: FD 2F B5 28)
+                local offset
+                offset=$(grep -boa $'\xfd\x2f\xb5\x28' "$initrd_file" | head -1 | cut -d: -f1 || echo "0")
+                if [ "$offset" -gt 0 ]; then
+                    info "  Offset zstd ditemukan: $offset bytes"
+                    # Ekstrak early_cpio dulu
+                    head -c "$offset" "$initrd_file" | \
+                        (cd "$extract_dir" && cpio -id --quiet 2>/dev/null || true)
+                    # Ekstrak main
+                    tail -c "+$((offset+1))" "$initrd_file" | \
+                        zstdcat | (cd "$extract_dir/main" && cpio -id --quiet 2>/dev/null || true)
+                else
+                    zstdcat "$initrd_file" | \
+                        (cd "$extract_dir/main" && cpio -id --quiet 2>/dev/null || true)
+                fi
+            else
+                die "zstd tidak ada: apt install zstd"
+            fi
+        elif echo "$fmt" | grep -qi "XZ"; then
+            xzcat "$initrd_file" | \
+                (cd "$extract_dir/main" && cpio -id --quiet 2>/dev/null || true)
+        elif echo "$fmt" | grep -qi "gzip"; then
+            zcat "$initrd_file" | \
+                (cd "$extract_dir/main" && cpio -id --quiet 2>/dev/null || true)
+        else
+            # Coba semua
+            zstdcat "$initrd_file" 2>/dev/null | \
+                (cd "$extract_dir/main" && cpio -id --quiet 2>/dev/null) || \
+            xzcat "$initrd_file" 2>/dev/null | \
+                (cd "$extract_dir/main" && cpio -id --quiet 2>/dev/null) || \
+            zcat "$initrd_file" 2>/dev/null | \
+                (cd "$extract_dir/main" && cpio -id --quiet 2>/dev/null) || \
+            die "Gagal mengekstrak initramfs"
+        fi
+    fi
+
+    log "=== Hasil ekstraksi ==="
+    info "Isi $extract_dir:"
+    ls "$extract_dir/" | while read -r d; do info "  $d/"; done
+
+    # Verifikasi: cari Programs/Linux dan modules
+    local main_dir=""
+    for candidate in "$extract_dir/main" "$extract_dir"; do
+        if [ -d "$candidate/Programs/Linux" ]; then
+            main_dir="$candidate"
+            info "Main filesystem di: $main_dir"
+            break
+        fi
+    done
+
+    if [ -n "$main_dir" ]; then
+        local kver_dir
+        kver_dir=$(find "$main_dir/Programs/Linux" -path "*/lib/modules/*/kernel" \
+                   -type d 2>/dev/null | head -1 | xargs dirname 2>/dev/null || true)
+        if [ -n "$kver_dir" ]; then
+            local kver; kver=$(basename "$kver_dir")
+            info "Kernel modules: $kver"
+            info "Total .ko: $(find "$kver_dir" -name '*.ko' 2>/dev/null | wc -l)"
+            info "Drivers tersedia:"
+            ls "$kver_dir/kernel/drivers/" 2>/dev/null | while read -r d; do
+                info "    drivers/$d/"
+            done
+        else
+            warn "Tidak menemukan lib/modules di main/"
+        fi
+
+        local bb="$main_dir/bin/busybox"
+        if [ -f "$bb" ]; then
+            info "BusyBox: $(file -b "$bb" | cut -c1-50)"
+        else
+            warn "BusyBox tidak ditemukan di $main_dir/bin/busybox"
+        fi
+    else
+        warn "Programs/Linux tidak ditemukan — struktur initramfs mungkin berbeda"
+        info "Isi direktori extract:"
+        find "$extract_dir" -maxdepth 3 | sort | head -40 | while read -r f; do
+            info "  ${f#$extract_dir/}"
+        done
+    fi
+
+    echo "$extract_dir"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAHAP 3: Salin main/ dari GoboLinux 017 initramfs sebagai base initrd kita
+# ─────────────────────────────────────────────────────────────────────────────
+build_from_gobo017_main() {
+    local extract_dir="$1"
+    log "=== Build initrd dari GoboLinux 017 main/ ==="
+
+    # Tentukan main_dir
+    local main_dir=""
+    for candidate in "$extract_dir/main" "$extract_dir"; do
+        if [ -d "$candidate/Programs/Linux" ] || [ -f "$candidate/bin/busybox" ]; then
+            main_dir="$candidate"
+            break
+        fi
+    done
+
+    if [ -z "$main_dir" ]; then
+        # Fallback: pakai seluruh extract_dir
+        main_dir="$extract_dir"
+        warn "Menggunakan seluruh extract_dir sebagai main"
+    fi
+
+    info "Sumber: $main_dir"
+    info "Ukuran: $(du -sh "$main_dir" | cut -f1)"
+
+    # Salin seluruh main/ ke INITRD_DIR
+    log "  Menyalin filesystem GoboLinux 017..."
+    mkdir -p "$INITRD_DIR"
+    cp -a "$main_dir/." "$INITRD_DIR/"
+
+    # Pastikan direktori wajib ada
     mkdir -p \
-        "$INITRD_DIR/bin" \
-        "$INITRD_DIR/sbin" \
-        "$INITRD_DIR/lib" \
-        "$INITRD_DIR/lib64" \
-        "$INITRD_DIR/lib/modules" \
         "$INITRD_DIR/proc" \
         "$INITRD_DIR/sys" \
         "$INITRD_DIR/dev" \
@@ -267,475 +284,217 @@ build_skeleton() {
         "$INITRD_DIR/tmp" \
         "$INITRD_DIR/run" \
         "$INITRD_DIR/mnt" \
-        "$INITRD_DIR/mnt/media" \
+        "$INITRD_DIR/mnt/scan" \
         "$INITRD_DIR/mnt/xzm" \
-        "$INITRD_DIR/mnt/overlay/upper" \
-        "$INITRD_DIR/mnt/overlay/work" \
-        "$INITRD_DIR/mnt/newroot" \
-        "$INITRD_DIR/etc"
+        "$INITRD_DIR/mnt/up" \
+        "$INITRD_DIR/mnt/wk" \
+        "$INITRD_DIR/mnt/new"
 
-    # Device nodes minimal (GoboLinux 016 style)
-    mknod -m 600 "$INITRD_DIR/dev/console" c 5 1
-    mknod -m 666 "$INITRD_DIR/dev/null"    c 1 3
-    mknod -m 666 "$INITRD_DIR/dev/zero"    c 1 5
-    mknod -m 666 "$INITRD_DIR/dev/random"  c 1 8
-    mknod -m 444 "$INITRD_DIR/dev/urandom" c 1 9
-    mknod -m 666 "$INITRD_DIR/dev/tty"     c 5 0
-    mknod -m 660 "$INITRD_DIR/dev/tty1"    c 4 1
+    # Device nodes minimal (mungkin sudah ada dari GoboLinux, tapi pastikan)
+    [ -c "$INITRD_DIR/dev/console" ] || mknod -m 600 "$INITRD_DIR/dev/console" c 5 1
+    [ -c "$INITRD_DIR/dev/null"    ] || mknod -m 666 "$INITRD_DIR/dev/null"    c 1 3
+    [ -c "$INITRD_DIR/dev/tty"     ] || mknod -m 666 "$INITRD_DIR/dev/tty"     c 5 0
+    [ -c "$INITRD_DIR/dev/tty1"    ] || mknod -m 660 "$INITRD_DIR/dev/tty1"    c 4 1
 
-    info "Skeleton dibuat"
-}
+    info "Isi INITRD_DIR (top level):"
+    ls "$INITRD_DIR/" | while read -r d; do info "  $d"; done
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TAHAP 3b: Salin modul kernel dari GoboLinux 017 ke dalam initramfs
-# Ini WAJIB agar modprobe bisa load sr_mod, cdrom, squashfs, overlay, loop
-# tanpa perlu modul ini built-in di kernel
-# ─────────────────────────────────────────────────────────────────────────────
-copy_kernel_modules() {
-    [ -n "$GOBO017_ROOT" ] || { warn "GOBO017_ROOT tidak disetel — skip copy modules"; return 0; }
-    [ -d "$GOBO017_ROOT" ] || { warn "GOBO017_ROOT tidak ada: $GOBO017_ROOT"; return 0; }
-
-    log "Menyalin modul kernel dari GoboLinux 017..."
-
-    # Cari direktori modules di Programs/Linux/<ver>/lib/modules/<kver>/
-    local kver_dir=""
-    local linux_prog="$GOBO017_ROOT/Programs/Linux"
-
-    if [ -d "$linux_prog" ]; then
-        # Resolve Current
-        local linux_cur="$linux_prog/Current"
-        [ -L "$linux_cur" ] && linux_cur=$(readlink -f "$linux_cur")
-        [ -d "$linux_cur" ] || linux_cur=$(find "$linux_prog" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)
-
-        # Cari di lib/modules/
-        kver_dir=$(find "$linux_cur/lib/modules" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
-        info "Programs/Linux: $linux_cur"
-    fi
-
-    # Fallback: cari di /lib/modules/ langsung di gobo-root
-    if [ -z "$kver_dir" ]; then
-        kver_dir=$(find "$GOBO017_ROOT/lib/modules" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -1)
-    fi
-
-    [ -n "$kver_dir" ] || { warn "Direktori modules tidak ditemukan di GoboLinux 017"; return 0; }
+    local ko_count
+    ko_count=$(find "$INITRD_DIR" -name '*.ko' 2>/dev/null | wc -l)
+    info ".ko files: $ko_count"
 
     local kver
-    kver=$(basename "$kver_dir")
-    info "Kernel versi: $kver"
-    info "Sumber modules: $kver_dir"
-
-    # Modul yang WAJIB ada di initramfs untuk boot via ISO/USB
-    # Dikelompokkan per fungsi
-    local REQUIRED_MODULES=(
-        # Optical drive — KRITIS untuk boot dari ISO/CD
-        "kernel/drivers/cdrom/cdrom.ko"
-        "kernel/drivers/scsi/sr_mod.ko"
-
-        # SCSI generic (dibutuhkan sr_mod)
-        "kernel/drivers/scsi/scsi_mod.ko"
-        "kernel/drivers/scsi/scsi_common.ko"
-
-        # Filesystem untuk mount media
-        "kernel/fs/isofs/isofs.ko"
-        "kernel/fs/squashfs/squashfs.ko"
-        "kernel/fs/overlayfs/overlay.ko"
-        "kernel/fs/fat/fat.ko"
-        "kernel/fs/fat/vfat.ko"
-        "kernel/fs/nls/nls_cp437.ko"
-        "kernel/fs/nls/nls_iso8859-1.ko"
-        "kernel/fs/nls/nls_utf8.ko"
-
-        # Loop device
-        "kernel/drivers/block/loop.ko"
-
-        # Hyper-V
-        "kernel/drivers/hv/hv_vmbus.ko"
-        "kernel/drivers/scsi/hv_storvsc.ko"
-        "kernel/drivers/net/hyperv/hv_netvsc.ko"
-        "kernel/drivers/hv/hv_utils.ko"
-
-        # VirtIO (QEMU/KVM)
-        "kernel/drivers/virtio/virtio.ko"
-        "kernel/drivers/virtio/virtio_ring.ko"
-        "kernel/drivers/virtio/virtio_pci.ko"
-        "kernel/drivers/block/virtio_blk.ko"
-        "kernel/drivers/net/virtio_net.ko"
-        "kernel/drivers/scsi/virtio_scsi.ko"
-
-        # USB Storage (boot dari USB)
-        "kernel/drivers/usb/storage/usb-storage.ko"
-        "kernel/drivers/usb/host/xhci-hcd.ko"
-        "kernel/drivers/usb/host/xhci-pci.ko"
-        "kernel/drivers/usb/host/ehci-hcd.ko"
-        "kernel/drivers/usb/host/ehci-pci.ko"
-    )
-
-    # Salin modul ke initramfs dengan struktur yang sama
-    local dst_base="$INITRD_DIR/lib/modules/$kver"
-    mkdir -p "$dst_base"
-
-    local copied=0 missing=0
-    for rel in "${REQUIRED_MODULES[@]}"; do
-        local src="$kver_dir/$rel"
-        if [ -f "$src" ]; then
-            local dst_dir="$dst_base/$(dirname "$rel")"
-            mkdir -p "$dst_dir"
-            cp "$src" "$dst_dir/"
-            copied=$((copied+1))
-        else
-            # Coba cari dengan nama file saja (path bisa berbeda antar versi)
-            local fname; fname=$(basename "$rel")
-            local found; found=$(find "$kver_dir" -name "$fname" 2>/dev/null | head -1)
-            if [ -n "$found" ]; then
-                local rel_found="${found#$kver_dir/}"
-                local dst_dir="$dst_base/$(dirname "$rel_found")"
-                mkdir -p "$dst_dir"
-                cp "$found" "$dst_dir/"
-                copied=$((copied+1))
-                info "  found (alt path): $fname"
-            else
-                warn "  tidak ada: $fname"
-                missing=$((missing+1))
-            fi
-        fi
-    done
-
-    # Salin modules.dep, modules.alias, modules.order agar modprobe bekerja
-    for meta in modules.dep modules.dep.bin modules.alias modules.alias.bin                 modules.order modules.builtin modules.builtin.bin                 modules.devname modules.softdep; do
-        [ -f "$kver_dir/$meta" ] && cp "$kver_dir/$meta" "$dst_base/"
-    done
-
-    # Buat symlink /lib/modules/<kver> -> path yang benar agar modprobe menemukan
-    mkdir -p "$INITRD_DIR/lib/modules"
-
-    info "Modul disalin: $copied, tidak ditemukan: $missing"
-    log "Copy kernel modules selesai: $kver"
+    kver=$(find "$INITRD_DIR" -path "*/lib/modules/*/kernel" -type d 2>/dev/null \
+           | head -1 | xargs dirname 2>/dev/null | xargs basename 2>/dev/null || true)
+    [ -n "$kver" ] && info "Kernel version: $kver"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TAHAP 4: Install BusyBox + applet symlinks
+# TAHAP 4: Salin early_cpio (microcode) untuk digabung saat pack
 # ─────────────────────────────────────────────────────────────────────────────
-install_busybox() {
-    log "Menginstal BusyBox..."
-    local bb_src="$WORK/busybox"
+save_early_cpio() {
+    local extract_dir="$1"
+    log "=== Simpan early_cpio (microcode) ==="
 
-    # Fallback jika Slax tidak disediakan
-    if [ ! -f "$bb_src" ]; then
-        warn "BusyBox dari Slax tidak ada, mencari alternatif..."
-        # Coba dari host
-        for candidate in /bin/busybox /usr/bin/busybox; do
-            if [ -f "$candidate" ] && file "$candidate" | grep -qi "statically linked"; then
-                cp "$candidate" "$bb_src"
-                warn "Menggunakan BusyBox host: $candidate"
-                break
-            fi
+    # unmkinitramfs menghasilkan early/ atau early0/, early1/, dst
+    local early_dir=""
+    for candidate in "$extract_dir/early" "$extract_dir/early0"; do
+        [ -d "$candidate" ] && { early_dir="$candidate"; break; }
+    done
+
+    if [ -n "$early_dir" ]; then
+        info "early_cpio: $early_dir"
+        info "Isi:"
+        find "$early_dir" -not -type d | head -10 | while read -r f; do
+            info "  ${f#$early_dir/}"
         done
-        [ -f "$bb_src" ] || die "BusyBox tidak tersedia. Sediakan Slax ISO via --slax"
+        # Simpan sebagai cpio untuk digabung
+        (cd "$early_dir" && find . | cpio -o -H newc --quiet 2>/dev/null) \
+            > "$WORK/early.cpio"
+        info "early.cpio: $(du -sh "$WORK/early.cpio" | cut -f1)"
+    else
+        info "Tidak ada early_cpio (microcode) — tidak apa-apa"
+        touch "$WORK/early.cpio"
     fi
-
-    cp "$bb_src" "$INITRD_DIR/bin/busybox"
-    chmod 755 "$INITRD_DIR/bin/busybox"
-
-    # Daftar applet yang dibutuhkan untuk boot GoboLinux + mount .xzm
-    # Diambil dari kebutuhan nyata startGoboLinux + xzm loader
-    local applets=(
-        # Shell & dasar
-        sh ash echo printf cat tee
-        # Filesystem & mount
-        mount umount losetup
-        switch_root pivot_root chroot
-        mkdir rm mv cp ln ls
-        # Device
-        mknod
-        # Modul kernel
-        modprobe insmod lsmod
-        # Proses
-        sleep kill killall ps
-        # Teks
-        grep sed awk cut head tail sort uniq wc
-        find xargs
-        # Disk
-        blkid lsblk fdisk
-        # Kompresi (untuk debugging)
-        gunzip xzcat zcat
-        # Jaringan (opsional, untuk PXE)
-        ifconfig ip
-        # Lainnya
-        true false test expr
-        free df du
-        dmesg
-        uname
-        date
-    )
-
-    for app in "${applets[@]}"; do
-        ln -sf busybox "$INITRD_DIR/bin/$app" 2>/dev/null || true
-    done
-
-    # Beberapa tool juga di sbin
-    for app in switch_root pivot_root modprobe insmod blkid losetup; do
-        ln -sf ../bin/busybox "$INITRD_DIR/sbin/$app" 2>/dev/null || true
-    done
-
-    info "BusyBox $(file -b "$INITRD_DIR/bin/busybox" | cut -c1-50)"
-    info "$(ls "$INITRD_DIR/bin/" | wc -l) file di /bin/"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TAHAP 5: Tulis /init
-# Terinspirasi dari GoboLinux 016 startGoboLinux + adaptasi Porteus-style .xzm
+# TAHAP 5: Tulis /init baru (ganti init GoboLinux 017 dengan init kita)
 # ─────────────────────────────────────────────────────────────────────────────
 write_init() {
-    log "Menulis /init (terinspirasi GoboLinux 016 startGoboLinux)..."
+    log "=== Tulis /init ==="
 
-    # Cek apakah ada script asli GoboLinux 016 sebagai referensi
-    local gobo016_script="$WORK/gobo016-initrd"
-    if [ -d "$gobo016_script" ]; then
-        info "Referensi GoboLinux 016 initrd tersedia di: $gobo016_script"
-        if [ -f "$gobo016_script/bin/startGoboLinux" ]; then
-            info "Ditemukan: bin/startGoboLinux"
-            info "5 baris pertama:"
-            head -5 "$gobo016_script/bin/startGoboLinux" | while read -r l; do
-                echo "    $l"
-            done
-        fi
+    # Backup init GoboLinux asli (untuk referensi)
+    if [ -f "$INITRD_DIR/init" ]; then
+        cp "$INITRD_DIR/init" "$INITRD_DIR/init.gobo-orig"
+        info "Init GoboLinux asli disimpan ke /init.gobo-orig"
     fi
 
-    cat > "$INITRD_DIR/init" << 'INIT_EOF'
+    # Tentukan path busybox yang tersedia
+    local bb_path=""
+    for candidate in \
+        "$INITRD_DIR/bin/busybox" \
+        "$INITRD_DIR/usr/bin/busybox" \
+        "$INITRD_DIR/sbin/busybox"; do
+        [ -f "$candidate" ] && { bb_path="${candidate#$INITRD_DIR}"; break; }
+    done
+    [ -n "$bb_path" ] && info "BusyBox: $bb_path" || warn "BusyBox tidak ditemukan!"
+
+    # Deteksi PATH yang benar dari initramfs GoboLinux
+    local gobo_path="/bin:/sbin:/usr/bin:/usr/sbin"
+    if [ -d "$INITRD_DIR/System/Links/Executables" ]; then
+        gobo_path="/System/Links/Executables:/System/Links/Libraries:$gobo_path"
+        info "Menggunakan System/Links PATH"
+    fi
+
+    cat > "$INITRD_DIR/init" << INIT_EOF
 #!/bin/sh
 # /init — GoboLinux 017 Live, Porteus-style
-# BusyBox (Slax) + modul kernel dari GoboLinux 017
-# Tidak pakai 'basename' sebagai command — pakai parameter expansion
-# Tidak pakai 'local' di luar fungsi
+# Hanya pakai: sh built-in, mount, mknod, sleep, cat, echo, dmesg
 
-export PATH=/bin:/sbin
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/System/Links/Executables
 
-print_status() { echo "GoboLinux: $*"; }
-warn()         { echo "GoboLinux [WARN]: $*"; }
+p() { echo "[init] $*"; }
 
-emergency_shell() {
-    echo "=== EMERGENCY SHELL ==="
-    echo "--- cmdline:"; cat /proc/cmdline
-    echo "--- /sys/block:"; ls /sys/block/ 2>/dev/null
-    echo "--- /dev:"; ls /dev/ 2>/dev/null
-    echo "--- modules:"; cat /proc/modules 2>/dev/null | cut -d' ' -f1
-    echo "--- dmesg:"; dmesg 2>/dev/null | tail -30
+die_shell() {
+    p "=== SHELL DARURAT ==="
+    p "cmdline: $(cat /proc/cmdline 2>/dev/null)"
+    p "sys/block: $(echo /sys/block/*)"
+    p "dev: $(echo /dev/sd* /dev/sr* /dev/hd* /dev/vd* 2>/dev/null)"
+    dmesg 2>/dev/null
     exec /bin/sh
 }
 
 # ── 1. Pseudo-filesystems ────────────────────────────────────────────────────
-mount -t proc     proc  /proc
-mount -t sysfs    sysfs /sys
-mount -t devtmpfs dev   /dev 2>/dev/null || mount -t tmpfs tmpfs /dev
-mkdir -p /dev/pts /dev/shm
+mount -t proc     proc  /proc  2>/dev/null
+mount -t sysfs    sysfs /sys   2>/dev/null
+mount -t devtmpfs dev   /dev   2>/dev/null || mount -t tmpfs tmpfs /dev 2>/dev/null
+mkdir -p /dev/pts /tmp /run
 mount -t devpts devpts /dev/pts 2>/dev/null || true
-mount -t tmpfs tmpfs /tmp
-mount -t tmpfs tmpfs /run
-print_status "Kernel: $(uname -r)"
+mount -t tmpfs tmpfs /tmp       2>/dev/null || true
+mount -t tmpfs tmpfs /run       2>/dev/null || true
+[ -c /dev/console ] || mknod -m 600 /dev/console c 5 1 2>/dev/null
+[ -c /dev/null    ] || mknod -m 666 /dev/null    c 1 3 2>/dev/null
+[ -c /dev/tty     ] || mknod -m 666 /dev/tty     c 5 0 2>/dev/null
+p "kernel: $(uname -r 2>/dev/null)"
 
-# ── 2. Load modul kernel dengan insmod eksplisit (tanpa dependency modprobe) ─
-# modprobe butuh modules.dep yang lengkap dan benar.
-# insmod lebih reliable di initramfs karena kita kontrol urutan sendiri.
-# Modul sudah disalin oleh copy_kernel_modules() di build-initrd.sh.
-print_status "Loading modules..."
-
-KVER=$(uname -r)
-MDIR="/lib/modules/$KVER"
-
-# Helper: cari file .ko di mana saja dalam MDIR, load dengan insmod
-load_mod() {
-    modname="$1"
-    # Cari file .ko — ganti - dengan [ _-] untuk match keduanya
-    kofile=$(find "$MDIR" -name "${modname}.ko" -o -name "${modname}.ko.xz" \
-             -o -name "${modname}.ko.zst" 2>/dev/null | head -1)
-    # Coba juga dengan dash diganti underscore dan sebaliknya
-    if [ -z "$kofile" ]; then
-        alt=$(echo "$modname" | tr '-' '_')
-        kofile=$(find "$MDIR" -name "${alt}.ko" 2>/dev/null | head -1)
-    fi
-    if [ -z "$kofile" ]; then
-        alt=$(echo "$modname" | tr '_' '-')
-        kofile=$(find "$MDIR" -name "${alt}.ko" 2>/dev/null | head -1)
-    fi
-    if [ -n "$kofile" ]; then
-        insmod "$kofile" 2>/dev/null && \
-            print_status "  insmod: $modname" || \
-            print_status "  skip (sudah ada?): $modname"
-        return 0
-    fi
-    # Fallback ke modprobe jika insmod tidak bisa
-    modprobe "$modname" 2>/dev/null && print_status "  modprobe: $modname" || true
-    return 0
-}
-
-# Urutan eksplisit — dependency dulu
-# SCSI core
-load_mod scsi_mod
-load_mod scsi_common
-
-# Hyper-V: hv_vmbus WAJIB sebelum hv_storvsc
-load_mod hv_vmbus
-load_mod hv_storvsc
-load_mod hv_utils
-
-# VirtIO (QEMU/KVM)
-load_mod virtio
-load_mod virtio_ring
-load_mod virtio_pci
-load_mod virtio_blk
-load_mod virtio_scsi
-
-# Optical drive
-load_mod cdrom
-load_mod sr_mod
-
-# Filesystem
-load_mod isofs
-load_mod squashfs
-load_mod overlay
-load_mod loop
-load_mod fat
-load_mod vfat
-
-# USB (untuk boot dari USB)
-load_mod usb_common
-load_mod usbcore
-load_mod xhci_hcd
-load_mod xhci_pci
-load_mod ehci_hcd
-load_mod ehci_pci
-load_mod usb_storage
-
-# ── 3. Buat device nodes dari /sys/block ─────────────────────────────────────
-# Gunakan parameter expansion bukan basename (lebih portable di ash BusyBox)
-print_status "Buat device nodes..."
-
-make_node() {
-    sysf="$1"
-    node="$2"
-    [ -f "$sysf" ] || return 1
-    mm=$(cat "$sysf")
-    mknod "$node" b "${mm%%:*}" "${mm##*:}" 2>/dev/null || true
-    [ -b "$node" ] && print_status "  $node (${mm%%:*}:${mm##*:})"
-}
-
-scan_and_make_nodes() {
+# ── 2. Device nodes dari /sys/block ──────────────────────────────────────────
+make_nodes() {
     for blk in /sys/block/*; do
         [ -d "$blk" ] || continue
-        # Pakai ${blk##*/} bukan basename — tidak butuh basename applet
-        bname="${blk##*/}"
-        make_node "$blk/dev" "/dev/$bname"
-        # Partisi
-        for part in "$blk/$bname"[0-9] "$blk/${bname}"[0-9][0-9] \
-                    "$blk/${bname}p"[0-9] "$blk/${bname}p"[0-9][0-9]; do
+        bn="${blk##*/}"
+        case "$bn" in loop*|ram*|zram*|dm*) continue ;; esac
+        [ -f "$blk/dev" ] || continue
+        mm=$(cat "$blk/dev")
+        [ -b "/dev/$bn" ] || mknod "/dev/$bn" b "${mm%%:*}" "${mm##*:}" 2>/dev/null
+        p "  node: /dev/$bn"
+        for part in "$blk/${bn}"[0-9] "$blk/${bn}"[0-9][0-9]                     "$blk/${bn}p"[0-9] "$blk/${bn}p"[0-9][0-9]; do
             [ -d "$part" ] || continue
-            pname="${part##*/}"
-            make_node "$part/dev" "/dev/$pname"
+            pn="${part##*/}"
+            [ -f "$part/dev" ] || continue
+            pm=$(cat "$part/dev")
+            [ -b "/dev/$pn" ] || mknod "/dev/$pn" b "${pm%%:*}" "${pm##*:}" 2>/dev/null
         done
     done
-    # Optical via /sys/class/block
-    for cd in /sys/class/block/sr* /sys/class/block/scd*; do
-        [ -d "$cd" ] || continue
-        cdname="${cd##*/}"
-        make_node "$cd/dev" "/dev/$cdname"
+    for sr in /sys/class/block/sr* /sys/class/block/scd*; do
+        [ -d "$sr" ] || continue
+        sn="${sr##*/}"
+        [ -f "$sr/dev" ] || continue
+        sm=$(cat "$sr/dev")
+        [ -b "/dev/$sn" ] || mknod "/dev/$sn" b "${sm%%:*}" "${sm##*:}" 2>/dev/null
+        p "  node: /dev/$sn (optical)"
     done
 }
+p "device nodes..."
+make_nodes
 
-scan_and_make_nodes
-
-# ── 4. Tunggu storage device muncul di /sys/block ────────────────────────────
-print_status "Tunggu storage device..."
-waited=0
-while [ $waited -lt 20 ]; do
-    found=0
+# ── 3. Tunggu storage ────────────────────────────────────────────────────────
+p "tunggu storage..."
+i=0
+while [ $i -lt 30 ]; do
+    found=""
     for blk in /sys/block/*; do
         [ -d "$blk" ] || continue
-        bname="${blk##*/}"
-        case "$bname" in
-            loop*|ram*|zram*|"*") continue ;;
-        esac
-        found=1
-        break
+        n="${blk##*/}"
+        case "$n" in sd*|hd*|vd*|xvd*|nvme*|mmcblk*|sr*|scd*) found="$n"; break ;; esac
     done
-
-    if [ $found -eq 1 ]; then
-        print_status "  Storage muncul setelah ${waited}s"
-        scan_and_make_nodes
+    if [ -n "$found" ]; then
+        p "  storage: $found (${i}s)"
+        make_nodes
         break
     fi
-
+    i=$((i+1))
+    p "  ${i}s /sys/block: $(echo /sys/block/*)"
     sleep 1
-    waited=$((waited+1))
-    print_status "  ${waited}s..."
-
-    # Retry load modul Hyper-V (kadang perlu beberapa detik)
-    load_mod hv_vmbus   2>/dev/null
-    load_mod hv_storvsc 2>/dev/null
-    load_mod virtio_blk 2>/dev/null
-    load_mod sr_mod     2>/dev/null
+    if [ $i -eq 5 ]; then
+        p "--- dmesg ---"
+        dmesg 2>/dev/null
+        p "--- end dmesg ---"
+    fi
 done
 
-print_status "Storage devices:"
-for blk in /sys/block/*; do
-    [ -d "$blk" ] || continue
-    bname="${blk##*/}"
-    case "$bname" in loop*|ram*|zram*) continue ;; esac
-    print_status "  /dev/$bname"
-done
-
-# ── 5. Parse cmdline ─────────────────────────────────────────────────────────
-FROM_PATH=""
-CHANGES_PATH=""
-COPY2RAM=0
-NOMAGIC=0
-LOAD_LIST=""
-
-for p in $(cat /proc/cmdline); do
-    case "$p" in
-        from=*)    FROM_PATH="${p#from=}"            ;;
-        changes=*) CHANGES_PATH="${p#changes=}"      ;;
-        copy2ram)  COPY2RAM=1                        ;;
-        nomagic)   NOMAGIC=1                         ;;
-        load=*)    LOAD_LIST="$LOAD_LIST ${p#load=}" ;;
+# ── 4. Parse cmdline ─────────────────────────────────────────────────────────
+FROM_PATH="" CHANGES_PATH="" COPY2RAM=0 NOMAGIC=0 LOAD_LIST=""
+for arg in $(cat /proc/cmdline 2>/dev/null); do
+    case "$arg" in
+        from=*)    FROM_PATH="${arg#from=}"            ;;
+        changes=*) CHANGES_PATH="${arg#changes=}"      ;;
+        copy2ram)  COPY2RAM=1                          ;;
+        nomagic)   NOMAGIC=1                           ;;
+        load=*)    LOAD_LIST="$LOAD_LIST ${arg#load=}" ;;
     esac
 done
 
-# ── 6. Cari /porteus/base/*.xzm ──────────────────────────────────────────────
-print_status "Cari media boot..."
-PORTEUS_DIR=""
-MEDIA_MNT=""
-SCAN_MNT="/mnt/scan"
-mkdir -p "$SCAN_MNT"
+# ── 5. Cari /porteus/base/*.xzm ──────────────────────────────────────────────
+p "cari media..."
+PORTEUS_DIR="" MEDIA_MNT=""
+mkdir -p /mnt/scan
 
-try_one() {
-    tdev="$1" tfs="$2"
-    umount "$SCAN_MNT" 2>/dev/null || true
-    mount -t "$tfs" -o ro "$tdev" "$SCAN_MNT" 2>/dev/null || return 1
-    if [ -d "$SCAN_MNT/porteus/base" ] && \
-       ls "$SCAN_MNT/porteus/base/"*.xzm >/dev/null 2>&1; then
-        return 0
+try_mount() {
+    umount /mnt/scan 2>/dev/null || true
+    mount -t "$2" -o ro "$1" /mnt/scan 2>/dev/null || return 1
+    if [ -d /mnt/scan/porteus/base ]; then
+        for xzm in /mnt/scan/porteus/base/*.xzm; do
+            [ -f "$xzm" ] && return 0
+        done
     fi
-    umount "$SCAN_MNT" 2>/dev/null || true
+    umount /mnt/scan 2>/dev/null || true
     return 1
 }
 
-scan_devices() {
+scan_all() {
     for blk in /sys/block/*; do
         [ -d "$blk" ] || continue
-        bname="${blk##*/}"
-        case "$bname" in loop*|ram*|zram*) continue ;; esac
-        [ -b "/dev/$bname" ] || continue
-
-        for tdev in "/dev/$bname" \
-                    "/dev/${bname}1" "/dev/${bname}2" \
-                    "/dev/${bname}p1" "/dev/${bname}p2"; do
-            [ -b "$tdev" ] || continue
-            print_status "  try: $tdev"
-            for tfs in iso9660 udf vfat exfat ext4 ext3 ext2; do
-                if try_one "$tdev" "$tfs"; then
-                    PORTEUS_DIR="$SCAN_MNT/porteus"
-                    MEDIA_MNT="$SCAN_MNT"
-                    print_status "  FOUND: $tdev ($tfs)"
+        bn="${blk##*/}"
+        case "$bn" in loop*|ram*|zram*|dm*) continue ;; esac
+        for dev in "/dev/$bn" "/dev/${bn}1" "/dev/${bn}2"                    "/dev/${bn}p1" "/dev/${bn}p2"; do
+            [ -b "$dev" ] || continue
+            p "  try: $dev"
+            for fs in iso9660 udf vfat exfat ext4 ext3 ext2; do
+                if try_mount "$dev" "$fs"; then
+                    PORTEUS_DIR=/mnt/scan/porteus
+                    MEDIA_MNT=/mnt/scan
+                    p "  FOUND: $dev ($fs)"
                     return 0
                 fi
             done
@@ -746,60 +505,48 @@ scan_devices() {
 
 if [ -n "$FROM_PATH" ]; then
     case "$FROM_PATH" in
-        /dev/*)
-            for tfs in iso9660 udf vfat ext4 ext3 ext2; do
-                try_one "$FROM_PATH" "$tfs" && {
-                    PORTEUS_DIR="$SCAN_MNT/porteus"
-                    MEDIA_MNT="$SCAN_MNT"
-                    break
-                }
-            done ;;
+        /dev/*) for fs in iso9660 udf vfat ext4 ext3 ext2; do
+                    try_mount "$FROM_PATH" "$fs" && {
+                        PORTEUS_DIR=/mnt/scan/porteus; MEDIA_MNT=/mnt/scan; break; }
+                done ;;
         *) [ -d "$FROM_PATH/porteus/base" ] && PORTEUS_DIR="$FROM_PATH/porteus" ;;
     esac
 fi
-
-[ -z "$PORTEUS_DIR" ] && { scan_devices || true; }
+[ -z "$PORTEUS_DIR" ] && { scan_all || true; }
 
 if [ -z "$PORTEUS_DIR" ]; then
-    warn "Tidak menemukan /porteus/base/*.xzm"
-    emergency_shell
+    p "GAGAL menemukan porteus/ — sys/block: $(echo /sys/block/*)"
+    dmesg 2>/dev/null
+    die_shell
 fi
+p "media: $PORTEUS_DIR"
 
-# ── 7. Copy to RAM ───────────────────────────────────────────────────────────
+# ── 6. Copy to RAM ───────────────────────────────────────────────────────────
 if [ "$COPY2RAM" = "1" ]; then
-    print_status "copy2ram..."
+    p "copy2ram..."
     mkdir -p /mnt/ram
-    SZ=$(du -sk "$PORTEUS_DIR" 2>/dev/null | cut -f1)
-    SZ_MB=$(( (SZ / 1024) + 128 ))
-    mount -t tmpfs -o "size=${SZ_MB}m" tmpfs /mnt/ram
+    mount -t tmpfs tmpfs /mnt/ram
     cp -a "$PORTEUS_DIR/." /mnt/ram/
     sync
     [ -n "$MEDIA_MNT" ] && umount "$MEDIA_MNT" 2>/dev/null || true
-    PORTEUS_DIR="/mnt/ram"
+    PORTEUS_DIR=/mnt/ram
 fi
 
-# ── 8. Mount .xzm → OverlayFS ────────────────────────────────────────────────
-print_status "Mount .xzm..."
+# ── 7. Mount .xzm -> OverlayFS ───────────────────────────────────────────────
+p "mount .xzm..."
 mkdir -p /mnt/xzm /mnt/up /mnt/wk /mnt/new
 LOWER="" IDX=0
-
 mount_xzm() {
-    xf="$1"
-    xmpt="/mnt/xzm/$IDX"
-    mkdir -p "$xmpt"
-    if mount -t squashfs -o loop,ro "$xf" "$xmpt" 2>/dev/null; then
-        xname="${xf##*/}"
-        print_status "  + $xname"
-        if [ -z "$LOWER" ]; then LOWER="$xmpt"
-        else LOWER="$LOWER:$xmpt"; fi
+    mp="/mnt/xzm/$IDX"
+    mkdir -p "$mp"
+    if mount -t squashfs -o loop,ro "$1" "$mp" 2>/dev/null; then
+        p "  +${1##*/}"
+        LOWER="${LOWER:+$LOWER:}$mp"
         IDX=$((IDX+1))
         return 0
     fi
-    xname="${xf##*/}"
-    warn "  gagal: $xname"
-    return 1
+    p "  GAGAL: ${1##*/}"
 }
-
 for xzm in "$PORTEUS_DIR/base/"*.xzm; do
     [ -f "$xzm" ] && mount_xzm "$xzm"
 done
@@ -812,45 +559,53 @@ for name in $LOAD_LIST; do
     done
 done
 
-[ -n "$LOWER" ] || { warn "Tidak ada .xzm di-mount"; emergency_shell; }
+[ -n "$LOWER" ] || { p "tidak ada .xzm ter-mount"; die_shell; }
+p "  $IDX modul di-mount"
 
 if [ "$NOMAGIC" = "1" ] || [ -z "$CHANGES_PATH" ]; then
-    mount -t tmpfs tmpfs /mnt/up
-    UP_DIR=/mnt/up
+    mount -t tmpfs tmpfs /mnt/up; UP=/mnt/up
 else
-    mkdir -p "$CHANGES_PATH"
-    UP_DIR="$CHANGES_PATH"
+    mkdir -p "$CHANGES_PATH"; UP="$CHANGES_PATH"
 fi
-mkdir -p "$UP_DIR" /mnt/wk
+mkdir -p /mnt/wk
+mount -t overlay overlay     -o "lowerdir=$LOWER,upperdir=$UP,workdir=/mnt/wk"     /mnt/new || { p "OverlayFS gagal"; die_shell; }
+p "overlay OK"
 
-mount -t overlay overlay \
-    -o "lowerdir=$LOWER,upperdir=$UP_DIR,workdir=/mnt/wk" \
-    /mnt/new \
-    || { warn "OverlayFS gagal"; emergency_shell; }
-print_status "OverlayFS OK"
+# ── Eksekusi InitializeCurrent: buat symlink Current di /Programs ─────────────
+# Script ini dihasilkan oleh generate_current_script() di build-gobo-live.sh
+# dan berisi: ln -snf "<ver>" "/Programs/<App>/Current" untuk setiap program
+INIT_CURRENT="/mnt/new/System/Settings/BootScripts/InitializeCurrent"
+if [ -x "$INIT_CURRENT" ]; then
+    p "Menjalankan InitializeCurrent..."
+    # Jalankan dalam konteks /mnt/new agar path /Programs/* benar
+    chroot /mnt/new /System/Settings/BootScripts/InitializeCurrent 2>/dev/null ||     sh "$INIT_CURRENT" 2>/dev/null || true
+    p "  InitializeCurrent selesai"
+else
+    p "  InitializeCurrent tidak ada — Current akan dibuat manual"
+fi
 
-# ── 9. GoboLinux System/Links ────────────────────────────────────────────────
-print_status "System/Links..."
+# ── 8. GoboLinux System/Links ────────────────────────────────────────────────
+p "System/Links..."
 if [ -d /mnt/new/Programs ]; then
     for prog in /mnt/new/Programs/*/; do
         [ -d "$prog" ] || continue
-        pname="${prog%/}"
-        pname="${pname##*/}"
         if [ -L "${prog}Current" ]; then
             ver=$(readlink -f "${prog}Current" 2>/dev/null)
         else
-            ver=$(find "$prog" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -1)
+            ver=""
+            for vd in "$prog"/*/; do
+                [ -d "$vd" ] && ver="$vd"
+            done
+            ver="${ver%/}"
         fi
         [ -d "$ver" ] || continue
         [ -e "${prog}Current" ] || ln -snf "$ver" "${prog}Current" 2>/dev/null
-        mkdir -p /mnt/new/System/Links/Executables \
-                 /mnt/new/System/Links/Libraries
+        mkdir -p /mnt/new/System/Links/Executables /mnt/new/System/Links/Libraries
         for sub in bin sbin; do
             [ -d "$ver/$sub" ] || continue
             for f in "$ver/$sub/"*; do
                 [ -e "$f" ] || continue
-                fname="${f##*/}"
-                dst="/mnt/new/System/Links/Executables/$fname"
+                dst="/mnt/new/System/Links/Executables/${f##*/}"
                 [ -e "$dst" ] || ln -s "$f" "$dst" 2>/dev/null
             done
         done
@@ -858,42 +613,58 @@ if [ -d /mnt/new/Programs ]; then
             [ -d "$ver/$sub" ] || continue
             for f in "$ver/$sub/"*; do
                 [ -e "$f" ] || continue
-                fname="${f##*/}"
-                dst="/mnt/new/System/Links/Libraries/$fname"
+                dst="/mnt/new/System/Links/Libraries/${f##*/}"
                 [ -e "$dst" ] || ln -s "$f" "$dst" 2>/dev/null
             done
         done
     done
 fi
-for pair in "bin:/System/Links/Executables" "sbin:/System/Links/Executables" \
-            "lib:/System/Links/Libraries"   "lib64:/System/Links/Libraries"; do
+for pair in "bin:/System/Links/Executables" "sbin:/System/Links/Executables"             "lib:/System/Links/Libraries"   "lib64:/System/Links/Libraries"; do
     lnk="${pair%%:*}"; tgt="${pair#*:}"
     [ -e "/mnt/new/$lnk" ] || ln -s "$tgt" "/mnt/new/$lnk" 2>/dev/null || true
 done
 [ -e /mnt/new/usr ] || ln -s "/" /mnt/new/usr 2>/dev/null || true
 
-# ── 10. switch_root ──────────────────────────────────────────────────────────
-print_status "switch_root..."
-for fsinfo in "proc:proc:/proc" "sysfs:sysfs:/sys" "devtmpfs:dev:/dev" "tmpfs:tmpfs:/run"; do
-    t="${fsinfo%%:*}"; rest="${fsinfo#*:}"; src="${rest%%:*}"; dst="${rest#*:}"
-    mount -t "$t" "$src" "/mnt/new/$dst" 2>/dev/null || \
-    mount --bind "/$dst" "/mnt/new/$dst" 2>/dev/null || true
-done
+# ── 9. Setup /dev di newroot ─────────────────────────────────────────────────
+p "setup newroot..."
+mkdir -p /mnt/new/dev /mnt/new/proc /mnt/new/sys /mnt/new/run /mnt/new/tmp
+mount --bind /dev /mnt/new/dev 2>/dev/null ||     mount -t devtmpfs devtmpfs /mnt/new/dev 2>/dev/null || true
 mkdir -p /mnt/new/dev/pts
-mount -t devpts devpts /mnt/new/dev/pts 2>/dev/null || true
+mount --bind /dev/pts /mnt/new/dev/pts 2>/dev/null ||     mount -t devpts devpts /mnt/new/dev/pts 2>/dev/null || true
+[ -c /mnt/new/dev/console ] || mknod /mnt/new/dev/console c 5 1 2>/dev/null
+[ -c /mnt/new/dev/tty     ] || mknod /mnt/new/dev/tty     c 5 0 2>/dev/null
+[ -c /mnt/new/dev/null    ] || mknod /mnt/new/dev/null    c 1 3 2>/dev/null
+chmod 600 /mnt/new/dev/console 2>/dev/null || true
+chmod 666 /mnt/new/dev/tty    2>/dev/null || true
+chmod 666 /mnt/new/dev/null   2>/dev/null || true
+mount -t proc  proc  /mnt/new/proc 2>/dev/null || true
+mount -t sysfs sysfs /mnt/new/sys  2>/dev/null || true
+mount -t tmpfs tmpfs /mnt/new/run  2>/dev/null || true
+mount -t tmpfs tmpfs /mnt/new/tmp  2>/dev/null || true
 
+# ── 10. Cari dan exec init GoboLinux ─────────────────────────────────────────
+p "cari init..."
+p "  newroot: $(echo /mnt/new/*)"
 INIT=""
-for c in /mnt/new/sbin/init /mnt/new/System/Links/Executables/init \
-          /mnt/new/bin/init  /mnt/new/Programs/Sysvinit/Current/sbin/init; do
-    [ -x "$c" ] && { INIT="${c#/mnt/new}"; break; }
+for c in /mnt/new/sbin/init /mnt/new/System/Links/Executables/init           /mnt/new/bin/init  /mnt/new/Programs/Sysvinit/Current/sbin/init           /mnt/new/Programs/Systemd/Current/lib/systemd/systemd; do
+    if [ -x "$c" ]; then
+        INIT="${c#/mnt/new}"
+        p "  init: $INIT"
+        break
+    fi
 done
-[ -n "$INIT" ] || INIT="/bin/sh"
-
-print_status "exec switch_root -> $INIT"
+if [ -z "$INIT" ]; then
+    p "  init tidak ditemukan, Programs/:"
+    for d in /mnt/new/Programs/*/; do
+        [ -d "$d" ] && p "    ${d##/mnt/new/}"
+    done
+    INIT=/bin/sh
+fi
+p "exec switch_root -> $INIT"
 exec switch_root /mnt/new "$INIT"
+p "switch_root GAGAL"
+die_shell
 
-warn "switch_root gagal"
-emergency_shell
 INIT_EOF
 
     chmod 755 "$INITRD_DIR/init"
@@ -901,74 +672,109 @@ INIT_EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TAHAP 6: Pack menjadi initramfs cpio.xz
+# TAHAP 6: Pack menjadi initramfs
+# Format: [early_cpio tidak terkompresi] + [main cpio terkompresi zstd/xz]
 # ─────────────────────────────────────────────────────────────────────────────
 pack_initrd() {
-    log "Packing initramfs -> $OUTPUT_INITRD..."
+    log "=== Pack initramfs ==="
     mkdir -p "$(dirname "$OUTPUT_INITRD")"
 
-    cd "$INITRD_DIR"
+    log "  Isi INITRD_DIR (top 2 level):"
+    find "$INITRD_DIR" -maxdepth 2 | sort | head -40 | while read -r f; do
+        local rel="${f#$INITRD_DIR/}"
+        [ -d "$f" ] && info "  DIR  $rel/" || info "  FILE $rel"
+    done
+    info ".ko count : $(find "$INITRD_DIR" -name "*.ko" 2>/dev/null | wc -l)"
+    info "Ukuran    : $(du -sh "$INITRD_DIR" | cut -f1)"
+    info "init ada  : $([ -f "$INITRD_DIR/init" ] && echo YA || echo TIDAK)"
+    info "busybox   : $([ -f "$INITRD_DIR/bin/busybox" ] && echo YA || echo TIDAK)"
 
-    local COMP_CMD
-    if command -v xz &>/dev/null; then
-        # xz --check=crc32: format yang diterima kernel Linux dan GoboLinux 016/017
+    # Pilih kompresi
+    local COMP_EXT COMP_CMD
+    if command -v zstd &>/dev/null; then
+        COMP_EXT="zst"
+        COMP_CMD="zstd -9 --long"
+        info "Kompresi: zstd"
+    else
+        COMP_EXT="xz"
         COMP_CMD="xz -9 --check=crc32"
-        info "Kompresi: xz (kernel-compatible)"
-    else
-        die "xz tidak ditemukan: apt install xz-utils"
+        info "Kompresi: xz"
     fi
 
-    find . | sort | cpio -o -H newc --quiet | $COMP_CMD > "$OUTPUT_INITRD"
-    cd - >/dev/null
+    # Pack main cpio ke file sementara (JANGAN pakai $() untuk binary data)
+    local MAIN_COMP="$WORK/main.cpio.$COMP_EXT"
+    log "  Pack main cpio..."
+    ( cd "$INITRD_DIR" && find . | sort | cpio -o -H newc --quiet 2>/dev/null )         | $COMP_CMD > "$MAIN_COMP"
+    info "  main cpio: $(du -sh "$MAIN_COMP" | cut -f1)"
 
-    local size; size=$(du -sh "$OUTPUT_INITRD" | cut -f1)
-    log "Initramfs selesai: $OUTPUT_INITRD ($size)"
-
-    # Verifikasi: pastikan /init ada dalam cpio
-    if xzcat "$OUTPUT_INITRD" 2>/dev/null | cpio -t --quiet 2>/dev/null | grep -q "^init$"; then
-        info "Verifikasi: /init ditemukan dalam initramfs ✓"
+    # Gabung: early (uncompressed) + main (compressed)
+    if [ -s "$WORK/early.cpio" ]; then
+        cat "$WORK/early.cpio" "$MAIN_COMP" > "$OUTPUT_INITRD"
+        info "Format: early($(du -sh "$WORK/early.cpio" | cut -f1)) + main"
     else
-        warn "Verifikasi: /init mungkin tidak ada dalam initramfs!"
+        cp "$MAIN_COMP" "$OUTPUT_INITRD"
+        info "Format: main only"
     fi
+
+    log "  Output: $OUTPUT_INITRD ($(du -sh "$OUTPUT_INITRD" | cut -f1))"
+
+    # Verifikasi — gunakan main.cpio langsung (bukan output gabungan)
+    # karena output gabungan punya early uncompressed di depan
+    log "  Verifikasi isi main cpio:"
+    local VERIFY_DIR="$WORK/verify"
+    rm -rf "$VERIFY_DIR" && mkdir -p "$VERIFY_DIR"
+
+    if [ "$COMP_EXT" = "zst" ]; then
+        zstdcat "$MAIN_COMP" 2>/dev/null | cpio -id --quiet -D "$VERIFY_DIR" 2>/dev/null || true
+    else
+        xzcat "$MAIN_COMP" 2>/dev/null | cpio -id --quiet -D "$VERIFY_DIR" 2>/dev/null || true
+    fi
+
+    for check in "init" "bin/busybox" "lib/modules"; do
+        if [ -e "$VERIFY_DIR/$check" ]; then
+            info "    FOUND  : $check"
+        else
+            warn "    MISSING: $check"
+            local found_at
+            found_at=$(find "$VERIFY_DIR" -name "$(basename "$check")" 2>/dev/null | head -1)
+            [ -n "$found_at" ] && info "      ada di: ${found_at#$VERIFY_DIR/}"
+        fi
+    done
+
+    info "  Top-level initrd:"
+    ls "$VERIFY_DIR/" 2>/dev/null | while read -r d; do info "    $d"; done
+
+    log "=== pack selesai ==="
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 main() {
-    log "=== build-initrd.sh ==="
-    log "Strategi: GoboLinux 016 init logic + Slax BusyBox"
-    [ -n "$GOBO016_ISO"   ] && log "GoboLinux 016 ISO : $GOBO016_ISO"
-    [ -n "$SLAX_ISO"      ] && log "Slax ISO          : $SLAX_ISO"
-    [ -n "$GOBO017_ROOT"  ] && log "GoboLinux 017 root: $GOBO017_ROOT"
-    log "Output initrd     : $OUTPUT_INITRD"
+    log "=== build-initrd.sh (GoboLinux 017 initramfs base) ==="
+    log "  Output: $OUTPUT_INITRD"
+    [ -n "$GOBO017_INITRD"  ] && log "  initrd GoboLinux 017: $GOBO017_INITRD"
+    [ -n "$SLAX_ISO"        ] && warn "  --slax diabaikan (BusyBox dari GoboLinux 017)"
+    [ -n "$GOBO016_ISO"     ] && warn "  --gobo016 diabaikan"
+    [ -n "$GOBO017_ROOT"    ] && warn "  --gobo017root diabaikan (modules dari initramfs)"
     echo ""
 
-    mkdir -p "$WORK/gobo016-initrd"
+    local initrd_file
+    initrd_file=$(find_gobo017_initrd)
 
-    # Langkah 1: BusyBox dari Slax
-    [ -n "$SLAX_ISO" ] && extract_busybox_from_slax
+    local extract_dir
+    extract_dir=$(extract_gobo017_initrd "$initrd_file")
 
-    # Langkah 2: Referensi init dari GoboLinux 016
-    [ -n "$GOBO016_ISO" ] && extract_gobo016_initrd_structure
-
-    # Langkah 3: Build skeleton
-    build_skeleton
-
-    # Langkah 3b: Salin modul kernel dari GoboLinux 017 (WAJIB untuk sr_mod, dll)
-    copy_kernel_modules
-
-    # Langkah 4-6: Install busybox, tulis init, pack
-    install_busybox
+    build_from_gobo017_main "$extract_dir"
+    save_early_cpio "$extract_dir"
     write_init
     pack_initrd
 
     echo ""
     log "=== SELESAI ==="
     echo ""
-    echo "Selanjutnya:"
-    echo "  Salin ke output Porteus:"
-    echo "  cp $OUTPUT_INITRD /path/to/porteus-gobolinux/boot/syslinux/initrd.xz"
+    echo "initrd siap: $OUTPUT_INITRD"
+    echo "Selanjutnya: sudo make iso  atau  sudo make usb DEV=/dev/sdX"
 }
 
 main "$@"
