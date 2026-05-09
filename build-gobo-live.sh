@@ -328,7 +328,6 @@ sync_gobo_program() {
         # Mode Dev: Masukkan Include, Lib/pkgconfig, dan Static Libs
         rsync -ah --prune-empty-dirs \
             --include='*/' \
-            --include='Current/***' \
             --include='*/include/***' \
             --include='*/lib/pkgconfig/***' \
             --include='*/lib/*.a' \
@@ -344,7 +343,6 @@ sync_gobo_program() {
         # Mode Runtime: Logika filter rsync Anda (Tanpa Headers/Docs)
         rsync -ah --prune-empty-dirs \
             --include='*/' \
-            --include='Current/***' \
             --include='*/bin/***' \
             --include='*/sbin/***' \
             --include='*/lib/***' \
