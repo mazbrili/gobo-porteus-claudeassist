@@ -410,26 +410,27 @@ BASE_PROGS=(
 
 # ── Refaktor Fungsi Build (Contoh 001-base) ──────────────────────────────────
 build_001_base() {
-    log "=== 001-base.xzm (Optimized with Rsync) ==="
+    log "=== 001-base.xzm (Modular & Dynamic Current) ==="
     local staging="$WORK_DIR/staging/001-base"
     mkdir -p "$staging/Programs"
 
+    # Proses aplikasi dasar
     for prog in "${BASE_PROGS[@]}"; do
         local src="$WORK_DIR/gobo-root/Programs/$prog"
         [ -d "$src" ] || continue
-        info "+ $prog (runtime)"
         sync_gobo_program "$src" "$staging/Programs/" "runtime"
     done
+
+    # Masukkan skrip pemetaan Current ke lokasi inisialisasi
+    local init_dir="$staging/System/Settings/BootScripts"
+    mkdir -p "$init_dir"
+    cp "$WORK_DIR/$CURRENT_MAP_FILE" "$init_dir/InitializeCurrent"
     
-    # Salin System Files (Settings, dsb tetap pakai cp -a karena krusial)
-    [ -d "$WORK_DIR/gobo-root/System" ] && {
-        mkdir -p "$staging/System"
-        cp -a "$WORK_DIR/gobo-root/System/Settings" "$staging/System/"
-        cp -a "$WORK_DIR/gobo-root/System/Links" "$staging/System/"
-    }
+    # Salin System Files esensial lainnya
+    cp -a "$WORK_DIR/gobo-root/System/Settings/." "$staging/System/Settings/" 2>/dev/null || true
     
     make_xzm "$staging" "$OUTPUT_DIR/porteus/base/001-base.xzm" "001-base.xzm"
-}	
+}
 
 # ── 002-gobo-tools.xzm ────────────────────────────────────────────────────────
 TOOLS_PROGS=(
@@ -542,6 +543,31 @@ build_005_dev() {
     else
         warn "Modul dev kosong, tidak dibuat."
     fi
+}
+# ── 1. \\\Fungsi Kolektor Link Current ──────────────────────────────────────────
+# Menghasilkan skrip yang akan membuat link Current secara dinamis saat boot
+generate_current_script() {
+    log "Menghasilkan skrip pemetaan Current: $CURRENT_MAP_FILE"
+    local source_root="$WORK_DIR/gobo-root/Programs"
+    
+    cat > "$WORK_DIR/$CURRENT_MAP_FILE" << 'EOF'
+#!/bin/bash
+# Restorasi link Current secara dinamis untuk GoboLinux 17.01
+echo "--- Menginisialisasi Symlink Current di /Programs ---"
+EOF
+
+    # Scan semua link 'Current' di root asli
+    find "$source_root" -maxdepth 2 -name "Current" -type l | while read -r link; do
+        local app
+        app=$(basename "$(dirname "$link")")
+        local target
+        target=$(readlink "$link")
+        
+        # Tambahkan perintah pembuatan link ke skrip
+        echo "ln -snf \"$target\" \"/Programs/$app/Current\"" >> "$WORK_DIR/$CURRENT_MAP_FILE"
+    done
+    
+    chmod +x "$WORK_DIR/$CURRENT_MAP_FILE"
 }
 # ── porteus.cfg & grub.cfg ─────────────────────────────────────────────────────
 create_boot_config() {
@@ -691,15 +717,16 @@ main() {
 
     # 4. Ekstrak squashfs
     extract_squashfs "$SQUASHFS_SRC"
-
-    # 5. Build modul .xzm
+    # 5. Jalankan kolektor sebelum memproses modul
+    generate_current_script
+    # 6. Build modul .xzm
     build_000_kernel
     build_001_base
     build_002_tools
     build_003_xorg
     build_004_desktop
     build_005_dev
-    # 6. Buat konfigurasi bootloader
+    # 7. Buat konfigurasi bootloader
     create_boot_config
 
     show_summary
