@@ -17,12 +17,17 @@
 # Usage:
 #   sudo bash build-initrd.sh \
 #     --gobo017initrd /path/to/initramfs-gobo-orig \
+#     --porteus-initrd /path/to/porteus/boot/syslinux/initrd.xz \
 #     --output        /path/to/initrd.xz
 #
-# Optional:
-#   --gobo016  GoboLinux-016.iso  (tidak lagi diperlukan)
-#   --slax     slax.iso           (tidak lagi diperlukan, BusyBox dari GoboLinux)
-#   --gobo017root /path           (tidak lagi diperlukan)
+# --porteus-initrd: initrd.xz dari ISO Porteus — sumber BusyBox statik.
+#   Porteus memakai BusyBox statik dengan semua applet lengkap.
+#   Jika tidak disediakan, script mencari di PORTEUS_INITRD env atau auto-detect.
+#
+# Optional (backward compat, diabaikan):
+#   --gobo016  GoboLinux-016.iso
+#   --slax     slax.iso
+#   --gobo017root /path
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
@@ -30,6 +35,7 @@ set -euo pipefail
 # ── Parse argumen ─────────────────────────────────────────────────────────────
 GOBO017_INITRD=""
 OUTPUT_INITRD=""
+PORTEUS_INITRD="${PORTEUS_INITRD:-}"  # initrd.xz Porteus untuk BusyBox
 # Argumen lama tetap diterima tapi diabaikan (backward compat)
 GOBO016_ISO=""
 SLAX_ISO=""
@@ -40,6 +46,7 @@ while [ $# -gt 0 ]; do
         --gobo017initrd) GOBO017_INITRD="$2"; shift 2 ;;
         --output)        OUTPUT_INITRD="$2";  shift 2 ;;
         # Backward compat — diabaikan
+        --porteus-initrd) PORTEUS_INITRD="$2"; shift 2 ;;
         --gobo016)       GOBO016_ISO="$2";    shift 2 ;;
         --slax)          SLAX_ISO="$2";       shift 2 ;;
         --gobo017root)   GOBO017_ROOT="$2";   shift 2 ;;
@@ -310,6 +317,89 @@ build_from_gobo017_main() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TAHAP 3c: Ganti/lengkapi BusyBox dengan versi dari Porteus
+# Porteus BusyBox dikompilasi statik dengan applet lengkap (tail, grep, tr, dll)
+# GoboLinux mungkin tidak punya BusyBox atau versi dinamis yang tidak cocok
+# ─────────────────────────────────────────────────────────────────────────────
+install_busybox_from_porteus() {
+    log "=== Install BusyBox dari Porteus ==="
+
+    # Cari path BusyBox dari file yang ditulis build-gobo-live.sh
+    local bb_path=""
+    local path_file="$(dirname "$OUTPUT_INITRD")/../../.busybox-path"
+    path_file="$(realpath "$path_file" 2>/dev/null || echo "$path_file")"
+
+    if [ -f "$path_file" ]; then
+        bb_path=$(cat "$path_file")
+        info "Path dari .busybox-path: $bb_path"
+    fi
+
+    # Jika tidak ada di path_file, cari langsung dari WORK_DIR
+    if [ -z "$bb_path" ] || [ ! -f "$bb_path" ]; then
+        # Coba cari di /tmp/gobo-live-*/busybox-from-porteus
+        bb_path=$(find /tmp -maxdepth 2 -name "busybox-from-porteus" 2>/dev/null | head -1 || true)
+        [ -n "$bb_path" ] && info "BusyBox ditemukan via scan: $bb_path"
+    fi
+
+    if [ -z "$bb_path" ] || [ ! -f "$bb_path" ]; then
+        warn "BusyBox dari Porteus tidak tersedia"
+        warn "Pastikan PORTEUS_ISO disetel saat make build"
+        info "Cek apakah /bin/busybox sudah ada di initramfs GoboLinux..."
+        if [ -f "$INITRD_DIR/bin/busybox" ]; then
+            info "  Ada: $(file -b "$INITRD_DIR/bin/busybox" | cut -c1-60)"
+        else
+            warn "  TIDAK ADA — boot mungkin gagal karena tidak ada shell/mount"
+        fi
+        return 0
+    fi
+
+    info "BusyBox Porteus: $bb_path"
+    info "  Format : $(file -b "$bb_path" | cut -c1-60)"
+    info "  Ukuran : $(du -sh "$bb_path" | cut -f1)"
+
+    # Pastikan ini BusyBox statik (lebih reliable di initramfs)
+    if file "$bb_path" | grep -qi "statically linked"; then
+        info "  Statik : YA (ideal untuk initramfs)"
+    else
+        warn "  Statik : TIDAK — dynamic linked, mungkin butuh library"
+    fi
+
+    # Salin ke /bin/busybox di initramfs
+    mkdir -p "$INITRD_DIR/bin"
+    cp "$bb_path" "$INITRD_DIR/bin/busybox"
+    chmod 755 "$INITRD_DIR/bin/busybox"
+    info "  Disalin ke: $INITRD_DIR/bin/busybox"
+
+    # Buat symlinks applet yang dibutuhkan /init
+    # Porteus BusyBox punya semua ini
+    local applets=(
+        sh ash cat echo ls mkdir rm mv cp ln
+        mount umount losetup mknod
+        sleep true false test
+        cat echo printf
+        dmesg uname
+        switch_root
+        find xargs
+        sort
+    )
+    local linked=0
+    for app in "${applets[@]}"; do
+        local dst="$INITRD_DIR/bin/$app"
+        if [ ! -e "$dst" ]; then
+            ln -sf busybox "$dst" 2>/dev/null && linked=$((linked+1)) || true
+        fi
+    done
+    # Juga buat di /sbin untuk switch_root
+    mkdir -p "$INITRD_DIR/sbin"
+    for app in switch_root mknod mount umount; do
+        [ -e "$INITRD_DIR/sbin/$app" ] ||             ln -sf ../bin/busybox "$INITRD_DIR/sbin/$app" 2>/dev/null || true
+    done
+
+    info "  $linked symlinks applet dibuat"
+    log "BusyBox dari Porteus terpasang"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # TAHAP 4: Salin early_cpio (microcode) untuk digabung saat pack
 # ─────────────────────────────────────────────────────────────────────────────
 save_early_cpio() {
@@ -337,6 +427,133 @@ save_early_cpio() {
         touch "$WORK/early.cpio"
     fi
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAHAP 2b: Ekstrak BusyBox dari initrd.xz Porteus
+# Porteus initrd.xz berisi BusyBox statik yang dikompilasi dengan semua
+# applet yang dibutuhkan (mount, mknod, switch_root, sleep, dll).
+# Ini menggantikan BusyBox dari GoboLinux yang mungkin tidak ada.
+# ─────────────────────────────────────────────────────────────────────────────
+extract_busybox_from_porteus_initrd() {
+    log "=== Ekstrak BusyBox dari Porteus initrd ==="
+
+    # Resolve path initrd Porteus
+    local porteus_initrd="$PORTEUS_INITRD"
+
+    # Auto-detect: cari initrd.xz Porteus di lokasi standar output build
+    if [ -z "$porteus_initrd" ]; then
+        local output_syslinux
+        output_syslinux="$(dirname "$OUTPUT_INITRD")"
+        for candidate in             "$output_syslinux/porteus-initrd.xz"             "$output_syslinux/../../../boot/syslinux/initrd.xz.porteus"
+        do
+            [ -f "$candidate" ] && { porteus_initrd="$candidate"; break; }
+        done
+    fi
+
+    if [ -z "$porteus_initrd" ] || [ ! -f "$porteus_initrd" ]; then
+        warn "Porteus initrd tidak ditemukan — BusyBox tidak diinstall"
+        warn "Gunakan: --porteus-initrd /path/to/porteus/initrd.xz"
+        warn "Atau set: PORTEUS_INITRD=/path make initrd"
+        return 0
+    fi
+
+    log "  Porteus initrd: $porteus_initrd"
+    log "  Format: $(file -b "$porteus_initrd" | cut -c1-60)"
+    log "  Ukuran: $(du -sh "$porteus_initrd" | cut -f1)"
+
+    # Ekstrak ke direktori sementara
+    local porteus_extract="$WORK/porteus-initrd-extract"
+    mkdir -p "$porteus_extract"
+
+    local fmt
+    fmt=$(file -b "$porteus_initrd")
+
+    log "  Mengekstrak Porteus initrd..."
+    if echo "$fmt" | grep -qi "XZ"; then
+        xzcat "$porteus_initrd" | cpio -id --quiet -D "$porteus_extract" 2>/dev/null || true
+    elif echo "$fmt" | grep -qi "gzip"; then
+        zcat "$porteus_initrd" | cpio -id --quiet -D "$porteus_extract" 2>/dev/null || true
+    elif echo "$fmt" | grep -qi "Zstandard"; then
+        zstdcat "$porteus_initrd" | cpio -id --quiet -D "$porteus_extract" 2>/dev/null || true
+    else
+        # Coba semua format
+        xzcat   "$porteus_initrd" 2>/dev/null | cpio -id --quiet -D "$porteus_extract" 2>/dev/null ||         zcat    "$porteus_initrd" 2>/dev/null | cpio -id --quiet -D "$porteus_extract" 2>/dev/null ||         zstdcat "$porteus_initrd" 2>/dev/null | cpio -id --quiet -D "$porteus_extract" 2>/dev/null ||         { warn "Gagal mengekstrak Porteus initrd"; return 0; }
+    fi
+
+    log "  Isi Porteus initrd (top level):"
+    ls "$porteus_extract/" 2>/dev/null | while read -r d; do info "    $d"; done
+
+    # Cari binary busybox
+    local bb_src=""
+    for candidate in         "$porteus_extract/bin/busybox"         "$porteus_extract/usr/bin/busybox"         "$porteus_extract/busybox"
+    do
+        [ -f "$candidate" ] || continue
+        local ftype; ftype=$(file -b "$candidate")
+        if echo "$ftype" | grep -qi "ELF"; then
+            bb_src="$candidate"
+            info "  BusyBox ditemukan: ${candidate#$porteus_extract/}"
+            info "    $(file -b "$candidate" | cut -c1-60)"
+            info "    Ukuran: $(du -sh "$candidate" | cut -f1)"
+            break
+        fi
+    done
+
+    if [ -z "$bb_src" ]; then
+        warn "  BusyBox tidak ditemukan dalam Porteus initrd"
+        # Tampilkan isi bin/ untuk diagnosis
+        log "  Isi bin/ Porteus initrd:"
+        ls "$porteus_extract/bin/" 2>/dev/null | while read -r f; do info "    $f"; done
+        return 0
+    fi
+
+    # Install BusyBox ke INITRD_DIR
+    log "  Install BusyBox ke initramfs..."
+    mkdir -p "$INITRD_DIR/bin" "$INITRD_DIR/sbin"
+    cp "$bb_src" "$INITRD_DIR/bin/busybox"
+    chmod 755 "$INITRD_DIR/bin/busybox"
+
+    # Buat symlink applet dari busybox --list
+    # Gunakan daftar hardcode yang paling penting (portable, tidak butuh busybox --list)
+    local APPLETS_BIN="sh ash bash cat echo printf ls mkdir rm mv cp ln
+        mount umount losetup mknod modprobe insmod lsmod
+        sleep kill ps grep sed awk cut head find xargs sort
+        blkid lsblk fdisk df du free dmesg uname date
+        gunzip xzcat zcat zstdcat cpio tar gzip
+        ifconfig ip route ping
+        chroot switch_root pivot_root
+        true false test expr read"
+
+    local APPLETS_SBIN="switch_root pivot_root modprobe insmod blkid
+        losetup udevd udevadm mdev"
+
+    local count_bin=0 count_sbin=0
+    for app in $APPLETS_BIN; do
+        ln -sf busybox "$INITRD_DIR/bin/$app" 2>/dev/null && count_bin=$((count_bin+1)) || true
+    done
+    for app in $APPLETS_SBIN; do
+        ln -sf ../bin/busybox "$INITRD_DIR/sbin/$app" 2>/dev/null && count_sbin=$((count_sbin+1)) || true
+    done
+
+    info "  Symlink: $count_bin di /bin/, $count_sbin di /sbin/"
+
+    # Salin juga lib yang dibutuhkan BusyBox jika dynamic
+    if echo "$(file -b "$bb_src")" | grep -qi "dynamically linked"; then
+        warn "  BusyBox Porteus adalah dynamic linked — menyalin shared libraries..."
+        ldd "$bb_src" 2>/dev/null | grep -o '/[^ ]*' | while read -r lib; do
+            [ -f "$lib" ] || continue
+            local libdir; libdir="$(dirname "$lib")"
+            mkdir -p "$INITRD_DIR$libdir"
+            cp "$lib" "$INITRD_DIR$libdir/" 2>/dev/null || true
+            info "    lib: $lib"
+        done
+    else
+        info "  BusyBox statik — tidak perlu shared libraries"
+    fi
+
+    log "  BusyBox dari Porteus berhasil diinstall"
+    log "  Test: $("$INITRD_DIR/bin/busybox" echo "busybox OK" 2>/dev/null || echo "tidak bisa ditest di host")"
+}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TAHAP 5: Tulis /init baru (ganti init GoboLinux 017 dengan init kita)
@@ -754,7 +971,8 @@ main() {
     log "=== build-initrd.sh (GoboLinux 017 initramfs base) ==="
     log "  Output: $OUTPUT_INITRD"
     [ -n "$GOBO017_INITRD"  ] && log "  initrd GoboLinux 017: $GOBO017_INITRD"
-    [ -n "$SLAX_ISO"        ] && warn "  --slax diabaikan (BusyBox dari GoboLinux 017)"
+    [ -n "$SLAX_ISO"        ] && warn "  --slax diabaikan (BusyBox dari Porteus initrd)"
+    [ -n "$PORTEUS_INITRD"  ] && log  "  Porteus initrd  : $PORTEUS_INITRD"
     [ -n "$GOBO016_ISO"     ] && warn "  --gobo016 diabaikan"
     [ -n "$GOBO017_ROOT"    ] && warn "  --gobo017root diabaikan (modules dari initramfs)"
     echo ""
@@ -766,7 +984,13 @@ main() {
     extract_dir=$(extract_gobo017_initrd "$initrd_file")
 
     build_from_gobo017_main "$extract_dir"
+    install_busybox_from_porteus
     save_early_cpio "$extract_dir"
+
+    # Tahap 2b: Install BusyBox dari Porteus initrd
+    # (GoboLinux 017 initramfs tidak selalu punya BusyBox yang kompatibel)
+    extract_busybox_from_porteus_initrd
+
     write_init
     pack_initrd
 
