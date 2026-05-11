@@ -38,6 +38,7 @@ set -euo pipefail
 
 GOBO_ISO="${1:-GoboLinux-017.01-x86_64.iso}"
 OUTPUT_DIR="${2:-$(cd "$(dirname "$0")/.." && pwd)/output/porteus-gobolinux}"
+PORTEUS_ISO="${PORTEUS_ISO:-}"   # Set via: PORTEUS_ISO=/path/to/porteus.iso make build
 WORK_DIR="${TMPDIR:-/tmp}/gobo-live-$$"
 # gobo-root disimpan di luar WORK_DIR agar tidak ikut dihapus trap
 GOBO_ROOT_DIR="${TMPDIR:-/tmp}/gobo-live-root-$$"
@@ -178,6 +179,111 @@ detect_squashfs() {
     done < <(find "$WORK_DIR/iso" -not -type d -print0)
 
     echo "$found"
+}
+
+
+# ── Ekstrak file syslinux dari ISO Porteus ────────────────────────────────────
+# Porteus ISO berisi semua file .c32, isolinux.bin, vesamenu.c32, dll
+# yang dibutuhkan untuk boot BIOS/Legacy.
+# Porteus diunduh dari: https://porteus.org/porteus-downloads.html
+extract_syslinux_from_porteus() {
+    local dst="$OUTPUT_DIR/boot/syslinux"
+    mkdir -p "$dst"
+
+    # Cari Porteus ISO — dari argumen env atau scan direktori kerja
+    local porteus_iso="$PORTEUS_ISO"
+    if [ -z "$porteus_iso" ]; then
+        # Auto-detect: cari file Porteus*.iso di direktori script dan parent
+        local script_dir
+        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        for candidate in             "$script_dir"/../Porteus*.iso             "$script_dir"/../porteus*.iso             "$script_dir"/../../Porteus*.iso             "$(pwd)"/Porteus*.iso             "$(pwd)"/porteus*.iso
+        do
+            # Expand glob
+            for f in $candidate; do
+                [ -f "$f" ] && { porteus_iso="$f"; break 2; }
+            done
+        done
+    fi
+
+    if [ -z "$porteus_iso" ] || [ ! -f "$porteus_iso" ]; then
+        warn "Porteus ISO tidak ditemukan — syslinux dari GoboLinux ISO saja"
+        warn "Untuk syslinux lengkap: PORTEUS_ISO=/path/to/porteus.iso make build"
+        warn "Unduh: https://porteus.org/porteus-downloads.html"
+        return 0
+    fi
+
+    log "Ekstrak syslinux dari Porteus ISO: $porteus_iso"
+
+    local porteus_mnt="$WORK_DIR/porteus-mnt"
+    mkdir -p "$porteus_mnt"
+    mount -o loop,ro "$porteus_iso" "$porteus_mnt" || {
+        warn "Gagal mount Porteus ISO: $porteus_iso"
+        return 0
+    }
+
+    # Tampilkan isi boot/ Porteus untuk referensi
+    log "  Isi boot/ Porteus:"
+    find "$porteus_mnt/boot" -maxdepth 2 2>/dev/null | sort | while read -r f; do
+        local rel="${f#$porteus_mnt}"
+        [ -d "$f" ] && log "    DIR $rel/" ||             log "    $(du -sh "$f" 2>/dev/null | cut -f1)  $rel"
+    done
+
+    # File yang dicari dari Porteus:
+    # - isolinux.bin     : bootloader binary
+    # - vesamenu.c32     : menu grafis
+    # - menu.c32         : menu teks
+    # - chain.c32        : chainload
+    # - reboot.c32       : reboot
+    # - poweroff.c32     : poweroff
+    # - libcom32.c32     : library (dibutuhkan c32 lain)
+    # - libutil.c32      : library
+    # - ldlinux.c32      : library utama syslinux modern
+    # - splash.png/jpg   : background menu (opsional)
+    # - isohdpfx.bin     : untuk isohybrid (USB boot)
+
+    local copied=0 skipped=0
+    for isodir in         "$porteus_mnt/boot/syslinux"         "$porteus_mnt/boot/isolinux"         "$porteus_mnt/syslinux"         "$porteus_mnt/isolinux"
+    do
+        [ -d "$isodir" ] || continue
+        log "  Salin dari: ${isodir#$porteus_mnt}"
+        find "$isodir" -maxdepth 1 -type f | while read -r f; do
+            local bn="${f##*/}"
+            # Lewati file boot Porteus sendiri (kernel, initrd, porteus.cfg)
+            case "$bn" in
+                vmlinuz|kernel|initrd*|initramfs*|porteus.cfg|syslinux.cfg) continue ;;
+            esac
+            # Salin ke dst, jangan timpa jika sudah ada dari GoboLinux ISO
+            if [ ! -f "$dst/$bn" ]; then
+                cp "$f" "$dst/$bn" 2>/dev/null && copied=$((copied+1)) || true
+                info "    + $bn"
+            else
+                skipped=$((skipped+1))
+            fi
+        done
+        break  # Ambil dari direktori pertama yang ditemukan
+    done
+
+    # Khusus: salin isohdpfx.bin untuk isohybrid (USB dd boot)
+    for candidate in         "$porteus_mnt/boot/syslinux/isohdpfx.bin"         "$porteus_mnt/boot/isolinux/isohdpfx.bin"
+    do
+        [ -f "$candidate" ] && cp "$candidate" "$dst/isohdpfx.bin" &&             info "    + isohdpfx.bin (isohybrid)" && break
+    done
+
+    umount "$porteus_mnt" 2>/dev/null || true
+
+    log "  Syslinux dari Porteus: $copied file disalin, $skipped sudah ada"
+
+    # Verifikasi file kritis
+    local critical_ok=1
+    for critical in "isolinux.bin" "ldlinux.c32" "vesamenu.c32"; do
+        if [ -f "$dst/$critical" ]; then
+            info "  OK: $critical"
+        else
+            warn "  MISSING: $critical — boot mungkin gagal"
+            critical_ok=0
+        fi
+    done
+    [ "$critical_ok" = "1" ] && log "  Semua file syslinux kritis tersedia" ||         warn "  Beberapa file kritis tidak ada — coba ISO Porteus yang berbeda"
 }
 
 # ── Setup boot files ──────────────────────────────────────────────────────────
@@ -717,6 +823,9 @@ main() {
 
     # 3. Salin boot files
     setup_boot "$KERNEL_SRC" "$INITRAMFS_SRC"
+
+    # 3b. Lengkapi syslinux dari Porteus ISO (lebih lengkap dari GoboLinux)
+    extract_syslinux_from_porteus
 
     # 4. Ekstrak squashfs
     extract_squashfs "$SQUASHFS_SRC"
