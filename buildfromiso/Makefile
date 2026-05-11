@@ -78,8 +78,15 @@ initrd:
 	fi; \
 	echo "Menggunakan initramfs GoboLinux 017: $$INITRD_ORIG"; \
 	echo "Format: $$(file -b "$$INITRD_ORIG" | cut -c1-60)"; \
+	PORTEUS_INITRD_FILE="$(OUTPUT)/boot/syslinux/porteus-initrd.xz"; \
+	PORTEUS_ARG=""; \
+	[ -f "$$PORTEUS_INITRD_FILE" ] && PORTEUS_ARG="--porteus-initrd $$PORTEUS_INITRD_FILE"; \
+	[ -n "$(PORTEUS_ISO)" ] && [ -z "$$PORTEUS_ARG" ] && \
+	    PORTEUS_ARG="--porteus-initrd $(PORTEUS_ISO)"; \
+	echo "Porteus initrd: $${PORTEUS_ARG:-(tidak ada, BusyBox dari GoboLinux initramfs)}"; \
 	bash $(SCRIPTS)/build-initrd.sh \
 	    --gobo017initrd "$$INITRD_ORIG" \
+	    $$PORTEUS_ARG \
 	    --output "$$INITRD_OUT"
 
 
@@ -92,6 +99,6 @@ iso:
 	    "$$(pwd)/output/GoboLinux-Porteus-live.iso"
 
 clean:
-	@rm -rf $(OUTPUT) output/.gobo-root-path output/GoboLinux-Porteus-live.iso
+	@rm -rf $(OUTPUT) output/.gobo-root-path output/.busybox-path output/GoboLinux-Porteus-live.iso
 	@echo "Note: gobo-root di /tmp dibiarkan — hapus manual jika perlu"
 	@echo "Output dibersihkan"
