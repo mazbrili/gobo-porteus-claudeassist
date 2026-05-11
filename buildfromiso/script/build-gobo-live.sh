@@ -21,7 +21,7 @@
 #       ├── base/
 #       │   ├── 000-kernel.xzm
 #       │   ├── 001-base.xzm
-#       │   ├── 002-gobo-tools.xzm
+#       │   ├── 002-gobotool.xzm
 #       │   ├── 003-xorg.xzm
 #       │   └── 004-desktop.xzm
 #       ├── modules/
@@ -39,6 +39,7 @@ set -euo pipefail
 GOBO_ISO="${1:-GoboLinux-017.01-x86_64.iso}"
 OUTPUT_DIR="${2:-$(cd "$(dirname "$0")/.." && pwd)/output/porteus-gobolinux}"
 PORTEUS_ISO="${PORTEUS_ISO:-}"   # Set via: PORTEUS_ISO=/path/to/porteus.iso make build
+BUSYBOX_FROM_PORTEUS=""         # Diisi oleh extract_syslinux_from_porteus()
 WORK_DIR="${TMPDIR:-/tmp}/gobo-live-$$"
 # gobo-root disimpan di luar WORK_DIR agar tidak ikut dihapus trap
 GOBO_ROOT_DIR="${TMPDIR:-/tmp}/gobo-live-root-$$"
@@ -268,6 +269,69 @@ extract_syslinux_from_porteus() {
     do
         [ -f "$candidate" ] && cp "$candidate" "$dst/isohdpfx.bin" &&             info "    + isohdpfx.bin (isohybrid)" && break
     done
+
+    # Simpan Porteus initrd.xz ke output agar build-initrd.sh bisa auto-detect BusyBox
+    for candidate in         "$porteus_mnt/boot/syslinux/initrd.xz"         "$porteus_mnt/boot/isolinux/initrd.xz"         "$porteus_mnt/boot/syslinux/initrd.img"         "$porteus_mnt/porteus/boot/initrd.xz"
+    do
+        [ -f "$candidate" ] || continue
+        local porteus_initrd_dst="$OUTPUT_DIR/boot/syslinux/porteus-initrd.xz"
+        cp "$candidate" "$porteus_initrd_dst"
+        info "  Porteus initrd disimpan: ${candidate#$porteus_mnt} → boot/syslinux/porteus-initrd.xz"
+        info "    ($(du -sh "$porteus_initrd_dst" | cut -f1)) — berisi BusyBox untuk build-initrd.sh"
+        break
+    done
+
+    # ── Ekstrak BusyBox dari initrd.xz Porteus ─────────────────────────────────
+    # Porteus initrd.xz berisi BusyBox statik yang dikompilasi dengan applet
+    # lengkap — jauh lebih baik dari BusyBox GoboLinux yang mungkin tidak ada
+    log "  Ekstrak BusyBox dari Porteus initrd.xz..."
+    local porteus_initrd=""
+    for candidate in         "$porteus_mnt/boot/syslinux/initrd.xz"         "$porteus_mnt/boot/syslinux/initrd.img"         "$porteus_mnt/boot/initrd.xz"
+    do
+        [ -f "$candidate" ] && { porteus_initrd="$candidate"; break; }
+    done
+
+    if [ -n "$porteus_initrd" ]; then
+        local bb_extract="$WORK_DIR/porteus-initrd-extract"
+        mkdir -p "$bb_extract"
+        log "    Initrd Porteus: ${porteus_initrd#$porteus_mnt} ($(du -sh "$porteus_initrd" | cut -f1))"
+        log "    Format: $(file -b "$porteus_initrd" | cut -c1-50)"
+
+        # Ekstrak cpio — Porteus memakai xz
+        (cd "$bb_extract" &&             xzcat "$porteus_initrd" 2>/dev/null | cpio -id --quiet 2>/dev/null) ||         (cd "$bb_extract" &&             zcat  "$porteus_initrd" 2>/dev/null | cpio -id --quiet 2>/dev/null) || true
+
+        # Cari busybox di dalam initrd Porteus
+        local bb_found=""
+        for candidate in             "$bb_extract/bin/busybox"             "$bb_extract/usr/bin/busybox"             "$bb_extract/busybox"
+        do
+            if [ -f "$candidate" ]; then
+                bb_found="$candidate"
+                break
+            fi
+        done
+
+        if [ -n "$bb_found" ]; then
+            # Simpan ke WORK_DIR agar build-initrd.sh bisa menggunakannya
+            cp "$bb_found" "$WORK_DIR/busybox-from-porteus"
+            chmod +x "$WORK_DIR/busybox-from-porteus"
+            BUSYBOX_FROM_PORTEUS="$WORK_DIR/busybox-from-porteus"
+            log "    BusyBox Porteus: $(du -sh "$BUSYBOX_FROM_PORTEUS" | cut -f1)"
+            log "    Format: $(file -b "$BUSYBOX_FROM_PORTEUS" | cut -c1-60)"
+
+            # Simpan path ke file agar build-initrd.sh bisa temukan
+            echo "$BUSYBOX_FROM_PORTEUS" > "$(dirname "$OUTPUT_DIR")/.busybox-path"
+            log "    Path disimpan: $(dirname "$OUTPUT_DIR")/.busybox-path"
+        else
+            warn "    BusyBox tidak ditemukan di initrd Porteus"
+            log "    Isi initrd Porteus:"
+            find "$bb_extract" -maxdepth 2 | head -20 | while read -r f; do
+                log "      ${f#$bb_extract/}"
+            done
+        fi
+        rm -rf "$bb_extract"
+    else
+        warn "  initrd.xz Porteus tidak ditemukan di boot/syslinux/"
+    fi
 
     umount "$porteus_mnt" 2>/dev/null || true
 
@@ -541,16 +605,16 @@ build_001_base() {
     make_xzm "$staging" "$OUTPUT_DIR/porteus/base/001-base.xzm" "001-base.xzm"
 }
 
-# ── 002-gobo-tools.xzm ────────────────────────────────────────────────────────
+# ── 002-gobotool.xzm ─────────────────────────────────────────────────────────────
 TOOLS_PROGS=(
     Scripts Compile Manager GoboNet Freshen
     Python3 Python Git Perl
     OpenSSH Sudo Nano Vim GoboHide AbsTK Lua
 )
 
-build_002_tools() {
-    log "=== 002-gobo-tools.xzm ==="
-    local staging="$WORK_DIR/staging/002-gobo-tools"
+build_002_gobotool() {
+    log "=== 002-gobotool.xzm ==="
+    local staging="$WORK_DIR/staging/002-gobotool"
     mkdir -p "$staging/Programs"
 
     local count=0
@@ -563,7 +627,7 @@ build_002_tools() {
     done
     [ "$count" -eq 0 ] && warn "Tidak ada gobo-tools ditemukan"
 
-    make_xzm "$staging" "$OUTPUT_DIR/porteus/base/002-gobo-tools.xzm" "002-gobo-tools.xzm"
+    make_xzm "$staging" "$OUTPUT_DIR/porteus/base/002-gobotool.xzm" "002-gobotool.xzm"
 }
 
 # ── 003-xorg.xzm ─────────────────────────────────────────────────────────────
@@ -626,16 +690,35 @@ build_004_desktop() {
 }
 # ── 005-dev.xzm ───────────────────────────────────────────────────────────
 # ── List Program Modul 005-dev ────────────────────────────────────────────────
-# Nama program harus sesuai dengan nama di Programs/ GoboLinux 017
+# 05-dev.xzm: SEMUA program yang punya headers/source/pkgconfig
+# Mencakup semua program dari modul lain — mode "dev" hanya ambil
+# include/, lib/pkgconfig/, lib/*.a, lib/*.la, share/aclocal/
 DEV_PROGS=(
+    # Compiler & build tools
     Gcc Binutils Make M4 Bison Flex
     Autoconf Automake Libtool Pkg-config
+    # Kernel headers
     Linux-Headers
-    Python3
+    # Core libraries — headers dibutuhkan untuk compile
+    Glibc Zlib Openssl
+    PCRE PCRE2 Readline Ncurses NcursesW
+    LibPng LibJpeg-turbo LibTiff
+    Pixman Cairo Pango HarfBuzz FreeType FontConfig
+    # X11 headers
+    LibX11 LibXext LibXrender LibXft LibXi LibXtst
+    LibXfixes LibXcomposite LibXdamage LibXrandr
+    LibDRM LibGLVND Mesa
+    # System libraries
+    Dbus Udev Eudev Linux-PAM
+    Glib GObject-Introspection Atk Gtk+ Gtk+3 Gdk-Pixbuf
+    # Scripting
+    Python3 Perl Lua
+    # Dev tools
+    Git Curl Wget
 )
 build_005_dev() {
-    log "=== 005-dev.xzm (Development Tools) ==="
-    local staging="$WORK_DIR/staging/005-dev"
+    log "=== 05-dev.xzm (Headers + Source + pkgconfig) ==="
+    local staging="$WORK_DIR/staging/05-dev"
     mkdir -p "$staging/Programs"
 
     local count=0
@@ -649,7 +732,7 @@ build_005_dev() {
     
     # Tambahkan symlink linker untuk dev
     if [ "$count" -gt 0 ]; then
-        make_xzm "$staging" "$OUTPUT_DIR/porteus/optional/005-dev.xzm" "005-dev.xzm"
+        make_xzm "$staging" "$OUTPUT_DIR/porteus/optional/05-dev.xzm" "05-dev.xzm"
     else
         warn "Modul dev kosong, tidak dibuat."
     fi
@@ -834,7 +917,7 @@ main() {
     # 6. Build modul .xzm
     build_000_kernel
     build_001_base
-    build_002_tools
+    build_002_gobotool
     build_003_xorg
     build_004_desktop
     build_005_dev
