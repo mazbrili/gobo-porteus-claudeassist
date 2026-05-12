@@ -281,7 +281,33 @@ build_from_gobo017_main() {
     log "  Menyalin filesystem GoboLinux 017..."
     mkdir -p "$INITRD_DIR"
     cp -a "$main_dir/." "$INITRD_DIR/"
-
+    # --- TAMBAHAN LOGIKA DEKOMPRESI MODUL ---
+    log "  Memeriksa kompresi modul kernel (.zst)..."
+    local kver_path
+    kver_path=$(find "$INITRD_DIR" -path "*/lib/modules/*" -type d -maxdepth 1 | head -1)
+    
+    if [ -d "$kver_path" ]; then
+        local kver; kver=$(basename "$kver_path")
+        info "  Dekompresi modul untuk kernel: $kver"
+        
+        # Cari file .zst, dekompresi, lalu hapus aslinya
+        if command -v zstd &>/dev/null; then
+            find "$kver_path" -name "*.ko.zst" -exec zstd -d --rm {} \; 2>/dev/null || true
+            info "  Dekompresi selesai (.ko.zst -> .ko)"
+            
+            # UPDATE modules.dep
+            # Ini sangat penting agar modprobe tidak mencari file .zst yang sudah hilang
+            if command -v depmod &>/dev/null; then
+                info "  Memperbarui modules.dep..."
+                depmod -b "$INITRD_DIR" "$kver"
+            else
+                warn "  depmod tidak ditemukan di host, modules.dep mungkin tidak akurat!"
+            fi
+        else
+            warn "  zstd tidak ditemukan di host! Modul tetap dalam format .zst (berisiko gagal boot)."
+        fi
+    fi
+    # ----------------------------------------
     # Pastikan direktori wajib ada
     mkdir -p \
         "$INITRD_DIR/proc" \
@@ -316,88 +342,6 @@ build_from_gobo017_main() {
     [ -n "$kver" ] && info "Kernel version: $kver"
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TAHAP 3c: Ganti/lengkapi BusyBox dengan versi dari Porteus
-# Porteus BusyBox dikompilasi statik dengan applet lengkap (tail, grep, tr, dll)
-# GoboLinux mungkin tidak punya BusyBox atau versi dinamis yang tidak cocok
-# ─────────────────────────────────────────────────────────────────────────────
-install_busybox_from_porteus() {
-    log "=== Install BusyBox dari Porteus ==="
-
-    # Cari path BusyBox dari file yang ditulis build-gobo-live.sh
-    local bb_path=""
-    local path_file="$(dirname "$OUTPUT_INITRD")/../../.busybox-path"
-    path_file="$(realpath "$path_file" 2>/dev/null || echo "$path_file")"
-
-    if [ -f "$path_file" ]; then
-        bb_path=$(cat "$path_file")
-        info "Path dari .busybox-path: $bb_path"
-    fi
-
-    # Jika tidak ada di path_file, cari langsung dari WORK_DIR
-    if [ -z "$bb_path" ] || [ ! -f "$bb_path" ]; then
-        # Coba cari di /tmp/gobo-live-*/busybox-from-porteus
-        bb_path=$(find /tmp -maxdepth 2 -name "busybox-from-porteus" 2>/dev/null | head -1 || true)
-        [ -n "$bb_path" ] && info "BusyBox ditemukan via scan: $bb_path"
-    fi
-
-    if [ -z "$bb_path" ] || [ ! -f "$bb_path" ]; then
-        warn "BusyBox dari Porteus tidak tersedia"
-        warn "Pastikan PORTEUS_ISO disetel saat make build"
-        info "Cek apakah /bin/busybox sudah ada di initramfs GoboLinux..."
-        if [ -f "$INITRD_DIR/bin/busybox" ]; then
-            info "  Ada: $(file -b "$INITRD_DIR/bin/busybox" | cut -c1-60)"
-        else
-            warn "  TIDAK ADA — boot mungkin gagal karena tidak ada shell/mount"
-        fi
-        return 0
-    fi
-
-    info "BusyBox Porteus: $bb_path"
-    info "  Format : $(file -b "$bb_path" | cut -c1-60)"
-    info "  Ukuran : $(du -sh "$bb_path" | cut -f1)"
-
-    # Pastikan ini BusyBox statik (lebih reliable di initramfs)
-    if file "$bb_path" | grep -qi "statically linked"; then
-        info "  Statik : YA (ideal untuk initramfs)"
-    else
-        warn "  Statik : TIDAK — dynamic linked, mungkin butuh library"
-    fi
-
-    # Salin ke /bin/busybox di initramfs
-    mkdir -p "$INITRD_DIR/bin"
-    cp "$bb_path" "$INITRD_DIR/bin/busybox"
-    chmod 755 "$INITRD_DIR/bin/busybox"
-    info "  Disalin ke: $INITRD_DIR/bin/busybox"
-
-    # Buat symlinks applet yang dibutuhkan /init
-    # Porteus BusyBox punya semua ini
-    local applets=(
-        sh ash cat echo ls mkdir rm mv cp ln
-        mount umount losetup mknod
-        sleep true false test
-        cat echo printf
-        dmesg uname
-        switch_root
-        find xargs
-        sort
-    )
-    local linked=0
-    for app in "${applets[@]}"; do
-        local dst="$INITRD_DIR/bin/$app"
-        if [ ! -e "$dst" ]; then
-            ln -sf busybox "$dst" 2>/dev/null && linked=$((linked+1)) || true
-        fi
-    done
-    # Juga buat di /sbin untuk switch_root
-    mkdir -p "$INITRD_DIR/sbin"
-    for app in switch_root mknod mount umount; do
-        [ -e "$INITRD_DIR/sbin/$app" ] ||             ln -sf ../bin/busybox "$INITRD_DIR/sbin/$app" 2>/dev/null || true
-    done
-
-    info "  $linked symlinks applet dibuat"
-    log "BusyBox dari Porteus terpasang"
-}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TAHAP 4: Salin early_cpio (microcode) untuk digabung saat pack
@@ -584,303 +528,143 @@ write_init() {
         info "Menggunakan System/Links PATH"
     fi
 
-    cat > "$INITRD_DIR/init" << INIT_EOF
+    cat > "$INITRD_DIR/init" << 'INIT_EOF'
 #!/bin/sh
 # /init — GoboLinux 017 Live, Porteus-style
-# Hanya pakai: sh built-in, mount, mknod, sleep, cat, echo, dmesg
+# Fokus: Perbaikan TTY dan Deteksi CD-ROM QEMU
 
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/System/Links/Executables
 
 p() { echo "[init] $*"; }
 
+# Perbaikan fungsi Shell Darurat agar TTY bisa diakses
 die_shell() {
     p "=== SHELL DARURAT ==="
-    p "cmdline: $(cat /proc/cmdline 2>/dev/null)"
-    p "sys/block: $(echo /sys/block/*)"
-    p "dev: $(echo /dev/sd* /dev/sr* /dev/hd* /dev/vd* 2>/dev/null)"
-    dmesg 2>/dev/null
-    exec /bin/sh
+    p "Periksa apakah /dev/sr0 atau /dev/sd* ada di bawah ini:"
+    ls -l /dev/sr* /dev/sd* /dev/vd* 2>/dev/null
+    p "Isi /proc/partitions:"
+    cat /proc/partitions 2>/dev/null
+    
+    # Memaksa shell menggunakan console agar job control aktif
+    exec setsid sh -c 'exec sh </dev/console >/dev/console 2>&1'
 }
 
 # ── 1. Pseudo-filesystems ────────────────────────────────────────────────────
-mount -t proc     proc  /proc  2>/dev/null
-mount -t sysfs    sysfs /sys   2>/dev/null
-mount -t devtmpfs dev   /dev   2>/dev/null || mount -t tmpfs tmpfs /dev 2>/dev/null
-mkdir -p /dev/pts /tmp /run
-mount -t devpts devpts /dev/pts 2>/dev/null || true
-mount -t tmpfs tmpfs /tmp       2>/dev/null || true
-mount -t tmpfs tmpfs /run       2>/dev/null || true
+mount -t proc     proc  /proc    2>/dev/null
+mount -t sysfs    sysfs /sys     2>/dev/null
+# Penting: devtmpfs sangat disarankan agar QEMU otomatis membuat /dev/sr0
+mount -t devtmpfs dev   /dev     2>/dev/null || mount -t tmpfs tmpfs /dev 2>/dev/null
+
+mkdir -p /dev/pts /dev/shm /tmp /run
+mount -t devpts devpts /dev/pts 2>/dev/null
+mount -t tmpfs  tmpfs  /dev/shm 2>/dev/null
+
+# Pastikan node dasar ada untuk shell
 [ -c /dev/console ] || mknod -m 600 /dev/console c 5 1 2>/dev/null
-[ -c /dev/null    ] || mknod -m 666 /dev/null    c 1 3 2>/dev/null
-[ -c /dev/tty     ] || mknod -m 666 /dev/tty     c 5 0 2>/dev/null
-p "kernel: $(uname -r 2>/dev/null)"
+[ -c /dev/tty ]     || mknod -m 666 /dev/tty     c 5 0 2>/dev/null
 
-# ── 2. Device nodes dari /sys/block ──────────────────────────────────────────
-make_nodes() {
-    for blk in /sys/block/*; do
-        [ -d "$blk" ] || continue
-        bn="${blk##*/}"
-        case "$bn" in loop*|ram*|zram*|dm*) continue ;; esac
-        [ -f "$blk/dev" ] || continue
-        mm=$(cat "$blk/dev")
-        [ -b "/dev/$bn" ] || mknod "/dev/$bn" b "${mm%%:*}" "${mm##*:}" 2>/dev/null
-        p "  node: /dev/$bn"
-        for part in "$blk/${bn}"[0-9] "$blk/${bn}"[0-9][0-9]                     "$blk/${bn}p"[0-9] "$blk/${bn}p"[0-9][0-9]; do
-            [ -d "$part" ] || continue
-            pn="${part##*/}"
-            [ -f "$part/dev" ] || continue
-            pm=$(cat "$part/dev")
-            [ -b "/dev/$pn" ] || mknod "/dev/$pn" b "${pm%%:*}" "${pm##*:}" 2>/dev/null
-        done
-    done
-    for sr in /sys/class/block/sr* /sys/class/block/scd*; do
-        [ -d "$sr" ] || continue
-        sn="${sr##*/}"
-        [ -f "$sr/dev" ] || continue
-        sm=$(cat "$sr/dev")
-        [ -b "/dev/$sn" ] || mknod "/dev/$sn" b "${sm%%:*}" "${sm##*:}" 2>/dev/null
-        p "  node: /dev/$sn (optical)"
-    done
-}
-p "device nodes..."
-make_nodes
+p "kernel: $(uname -r)"
 
-# ── 3. Tunggu storage ────────────────────────────────────────────────────────
-p "tunggu storage..."
-i=0
-while [ $i -lt 30 ]; do
-    found=""
-    for blk in /sys/block/*; do
-        [ -d "$blk" ] || continue
-        n="${blk##*/}"
-        case "$n" in sd*|hd*|vd*|xvd*|nvme*|mmcblk*|sr*|scd*) found="$n"; break ;; esac
-    done
-    if [ -n "$found" ]; then
-        p "  storage: $found (${i}s)"
-        make_nodes
-        break
-    fi
-    i=$((i+1))
-    p "  ${i}s /sys/block: $(echo /sys/block/*)"
-    sleep 1
-    if [ $i -eq 5 ]; then
-        p "--- dmesg ---"
-        dmesg 2>/dev/null
-        p "--- end dmesg ---"
-    fi
+# ── 2. Load Kernel Modules (Penting untuk Q35 & SATA) ────────────────────────
+p "loading hardware drivers..."
+# ahci & libahci: Untuk kontroler SATA di mesin Q35
+# sr_mod & cdrom: Untuk pembaca CD-ROM
+# sd_mod: Untuk akses disk (SATA diperlakukan seperti SCSI)
+# isofs: Untuk membaca format ISO9660
+for mod in libahci ahci cdrom sr_mod sd_mod isofs squashfs overlay loop; do
+    modprobe $mod 2>/dev/null
 done
+sleep 3
 
-# ── 4. Parse cmdline ─────────────────────────────────────────────────────────
-FROM_PATH="" CHANGES_PATH="" COPY2RAM=0 NOMAGIC=0 LOAD_LIST=""
+# ── 3. Parse cmdline ─────────────────────────────────────────────────────────
+FROM_PATH=""
 for arg in $(cat /proc/cmdline 2>/dev/null); do
     case "$arg" in
-        from=*)    FROM_PATH="${arg#from=}"            ;;
-        changes=*) CHANGES_PATH="${arg#changes=}"      ;;
-        copy2ram)  COPY2RAM=1                          ;;
-        nomagic)   NOMAGIC=1                           ;;
-        load=*)    LOAD_LIST="$LOAD_LIST ${arg#load=}" ;;
+        from=*) FROM_PATH="${arg#from=}" ;;
     esac
 done
 
-# ── 5. Cari /porteus/base/*.xzm ──────────────────────────────────────────────
-p "cari media..."
-PORTEUS_DIR="" MEDIA_MNT=""
+# ── 4. Cari Media (Metode Non-Awk) ───────────────────────────────────────────
+p "mencari media..."
+PORTEUS_DIR=""
 mkdir -p /mnt/scan
 
 try_mount() {
-    umount /mnt/scan 2>/dev/null || true
-    mount -t "$2" -o ro "$1" /mnt/scan 2>/dev/null || return 1
-    if [ -d /mnt/scan/porteus/base ]; then
-        for xzm in /mnt/scan/porteus/base/*.xzm; do
-            [ -f "$xzm" ] && return 0
-        done
+    dev="$1"; fs="$2"
+    [ -b "$dev" ] || return 1
+    p "  mencoba $dev ($fs)..."
+    mount -t "$fs" -o ro "$dev" /mnt/scan 2>/dev/null || return 1
+    
+    # Cek folder porteus
+    if [ -d "/mnt/scan/porteus/base" ]; then
+        PORTEUS_DIR="/mnt/scan/porteus"
+        return 0
+    elif [ -n "$FROM_PATH" ] && [ -d "/mnt/scan${FROM_PATH}/base" ]; then
+        PORTEUS_DIR="/mnt/scan${FROM_PATH}"
+        return 0
     fi
-    umount /mnt/scan 2>/dev/null || true
+    
+    umount /mnt/scan 2>/dev/null
     return 1
 }
 
 scan_all() {
-    for blk in /sys/block/*; do
-        [ -d "$blk" ] || continue
-        bn="${blk##*/}"
-        case "$bn" in loop*|ram*|zram*|dm*) continue ;; esac
-        for dev in "/dev/$bn" "/dev/${bn}1" "/dev/${bn}2"                    "/dev/${bn}p1" "/dev/${bn}p2"; do
-            [ -b "$dev" ] || continue
-            p "  try: $dev"
-            for fs in iso9660 udf vfat exfat ext4 ext3 ext2; do
-                if try_mount "$dev" "$fs"; then
-                    PORTEUS_DIR=/mnt/scan/porteus
-                    MEDIA_MNT=/mnt/scan
-                    p "  FOUND: $dev ($fs)"
-                    return 0
-                fi
-            done
-        done
+    # 1. Cek spesifik sr* (CD-ROM QEMU)
+    for sr in /dev/sr*; do
+        [ -b "$sr" ] && try_mount "$sr" "iso9660" && return 0
     done
+
+    # 2. Cek semua di /proc/partitions (Disk/USB)
+    while read major minor blocks name; do
+        case "$name" in
+            ""|name|loop*|ram*|zram*) continue ;;
+        esac
+        
+        for fs in vfat ext4 ntfs iso9660; do
+            try_mount "/dev/$name" "$fs" && return 0
+        done
+    done < /proc/partitions
+    
     return 1
 }
 
-if [ -n "$FROM_PATH" ]; then
-    case "$FROM_PATH" in
-        /dev/*) for fs in iso9660 udf vfat ext4 ext3 ext2; do
-                    try_mount "$FROM_PATH" "$fs" && {
-                        PORTEUS_DIR=/mnt/scan/porteus; MEDIA_MNT=/mnt/scan; break; }
-                done ;;
-        *) [ -d "$FROM_PATH/porteus/base" ] && PORTEUS_DIR="$FROM_PATH/porteus" ;;
-    esac
-fi
-[ -z "$PORTEUS_DIR" ] && { scan_all || true; }
-
-if [ -z "$PORTEUS_DIR" ]; then
-    p "GAGAL menemukan porteus/ — sys/block: $(echo /sys/block/*)"
-    dmesg 2>/dev/null
+if ! scan_all; then
+    p "GAGAL: Media tidak ditemukan."
     die_shell
 fi
-p "media: $PORTEUS_DIR"
 
-# ── 6. Copy to RAM ───────────────────────────────────────────────────────────
-if [ "$COPY2RAM" = "1" ]; then
-    p "copy2ram..."
-    mkdir -p /mnt/ram
-    mount -t tmpfs tmpfs /mnt/ram
-    cp -a "$PORTEUS_DIR/." /mnt/ram/
-    sync
-    [ -n "$MEDIA_MNT" ] && umount "$MEDIA_MNT" 2>/dev/null || true
-    PORTEUS_DIR=/mnt/ram
-fi
+p "Media ditemukan di: $PORTEUS_DIR"
 
-# ── 7. Mount .xzm -> OverlayFS ───────────────────────────────────────────────
-p "mount .xzm..."
-mkdir -p /mnt/xzm /mnt/up /mnt/wk /mnt/new
-LOWER="" IDX=0
-mount_xzm() {
+# ── 5. Setup OverlayFS ───────────────────────────────────────────────────────
+p "assembling modules..."
+mkdir -p /mnt/xzm /mnt/up /mnt/wk /mnt/newroot
+LOWER=""
+IDX=0
+
+for xzm in "$PORTEUS_DIR/base/"*.xzm; do
+    [ -f "$xzm" ] || continue
     mp="/mnt/xzm/$IDX"
     mkdir -p "$mp"
-    if mount -t squashfs -o loop,ro "$1" "$mp" 2>/dev/null; then
-        p "  +${1##*/}"
+    if mount -t squashfs -o loop,ro "$xzm" "$mp" 2>/dev/null; then
         LOWER="${LOWER:+$LOWER:}$mp"
         IDX=$((IDX+1))
-        return 0
-    fi
-    p "  GAGAL: ${1##*/}"
-}
-for xzm in "$PORTEUS_DIR/base/"*.xzm; do
-    [ -f "$xzm" ] && mount_xzm "$xzm"
-done
-for xzm in "$PORTEUS_DIR/modules/"*.xzm; do
-    [ -f "$xzm" ] && mount_xzm "$xzm"
-done
-for name in $LOAD_LIST; do
-    for xf in "$PORTEUS_DIR/optional/$name" "$PORTEUS_DIR/optional/${name}.xzm"; do
-        [ -f "$xf" ] && mount_xzm "$xf" && break
-    done
-done
-
-[ -n "$LOWER" ] || { p "tidak ada .xzm ter-mount"; die_shell; }
-p "  $IDX modul di-mount"
-
-if [ "$NOMAGIC" = "1" ] || [ -z "$CHANGES_PATH" ]; then
-    mount -t tmpfs tmpfs /mnt/up; UP=/mnt/up
-else
-    mkdir -p "$CHANGES_PATH"; UP="$CHANGES_PATH"
-fi
-mkdir -p /mnt/wk
-mount -t overlay overlay     -o "lowerdir=$LOWER,upperdir=$UP,workdir=/mnt/wk"     /mnt/new || { p "OverlayFS gagal"; die_shell; }
-p "overlay OK"
-
-# ── Eksekusi InitializeCurrent: buat symlink Current di /Programs ─────────────
-# Script ini dihasilkan oleh generate_current_script() di build-gobo-live.sh
-# dan berisi: ln -snf "<ver>" "/Programs/<App>/Current" untuk setiap program
-INIT_CURRENT="/mnt/new/System/Settings/BootScripts/InitializeCurrent"
-if [ -x "$INIT_CURRENT" ]; then
-    p "Menjalankan InitializeCurrent..."
-    # Jalankan dalam konteks /mnt/new agar path /Programs/* benar
-    chroot /mnt/new /System/Settings/BootScripts/InitializeCurrent 2>/dev/null ||     sh "$INIT_CURRENT" 2>/dev/null || true
-    p "  InitializeCurrent selesai"
-else
-    p "  InitializeCurrent tidak ada — Current akan dibuat manual"
-fi
-
-# ── 8. GoboLinux System/Links ────────────────────────────────────────────────
-p "System/Links..."
-if [ -d /mnt/new/Programs ]; then
-    for prog in /mnt/new/Programs/*/; do
-        [ -d "$prog" ] || continue
-        if [ -L "${prog}Current" ]; then
-            ver=$(readlink -f "${prog}Current" 2>/dev/null)
-        else
-            ver=""
-            for vd in "$prog"/*/; do
-                [ -d "$vd" ] && ver="$vd"
-            done
-            ver="${ver%/}"
-        fi
-        [ -d "$ver" ] || continue
-        [ -e "${prog}Current" ] || ln -snf "$ver" "${prog}Current" 2>/dev/null
-        mkdir -p /mnt/new/System/Links/Executables /mnt/new/System/Links/Libraries
-        for sub in bin sbin; do
-            [ -d "$ver/$sub" ] || continue
-            for f in "$ver/$sub/"*; do
-                [ -e "$f" ] || continue
-                dst="/mnt/new/System/Links/Executables/${f##*/}"
-                [ -e "$dst" ] || ln -s "$f" "$dst" 2>/dev/null
-            done
-        done
-        for sub in lib lib64; do
-            [ -d "$ver/$sub" ] || continue
-            for f in "$ver/$sub/"*; do
-                [ -e "$f" ] || continue
-                dst="/mnt/new/System/Links/Libraries/${f##*/}"
-                [ -e "$dst" ] || ln -s "$f" "$dst" 2>/dev/null
-            done
-        done
-    done
-fi
-for pair in "bin:/System/Links/Executables" "sbin:/System/Links/Executables"             "lib:/System/Links/Libraries"   "lib64:/System/Links/Libraries"; do
-    lnk="${pair%%:*}"; tgt="${pair#*:}"
-    [ -e "/mnt/new/$lnk" ] || ln -s "$tgt" "/mnt/new/$lnk" 2>/dev/null || true
-done
-[ -e /mnt/new/usr ] || ln -s "/" /mnt/new/usr 2>/dev/null || true
-
-# ── 9. Setup /dev di newroot ─────────────────────────────────────────────────
-p "setup newroot..."
-mkdir -p /mnt/new/dev /mnt/new/proc /mnt/new/sys /mnt/new/run /mnt/new/tmp
-mount --bind /dev /mnt/new/dev 2>/dev/null ||     mount -t devtmpfs devtmpfs /mnt/new/dev 2>/dev/null || true
-mkdir -p /mnt/new/dev/pts
-mount --bind /dev/pts /mnt/new/dev/pts 2>/dev/null ||     mount -t devpts devpts /mnt/new/dev/pts 2>/dev/null || true
-[ -c /mnt/new/dev/console ] || mknod /mnt/new/dev/console c 5 1 2>/dev/null
-[ -c /mnt/new/dev/tty     ] || mknod /mnt/new/dev/tty     c 5 0 2>/dev/null
-[ -c /mnt/new/dev/null    ] || mknod /mnt/new/dev/null    c 1 3 2>/dev/null
-chmod 600 /mnt/new/dev/console 2>/dev/null || true
-chmod 666 /mnt/new/dev/tty    2>/dev/null || true
-chmod 666 /mnt/new/dev/null   2>/dev/null || true
-mount -t proc  proc  /mnt/new/proc 2>/dev/null || true
-mount -t sysfs sysfs /mnt/new/sys  2>/dev/null || true
-mount -t tmpfs tmpfs /mnt/new/run  2>/dev/null || true
-mount -t tmpfs tmpfs /mnt/new/tmp  2>/dev/null || true
-
-# ── 10. Cari dan exec init GoboLinux ─────────────────────────────────────────
-p "cari init..."
-p "  newroot: $(echo /mnt/new/*)"
-INIT=""
-for c in /mnt/new/sbin/init /mnt/new/System/Links/Executables/init           /mnt/new/bin/init  /mnt/new/Programs/Sysvinit/Current/sbin/init           /mnt/new/Programs/Systemd/Current/lib/systemd/systemd; do
-    if [ -x "$c" ]; then
-        INIT="${c#/mnt/new}"
-        p "  init: $INIT"
-        break
     fi
 done
-if [ -z "$INIT" ]; then
-    p "  init tidak ditemukan, Programs/:"
-    for d in /mnt/new/Programs/*/; do
-        [ -d "$d" ] && p "    ${d##/mnt/new/}"
-    done
-    INIT=/bin/sh
-fi
-p "exec switch_root -> $INIT"
-exec switch_root /mnt/new "$INIT"
-p "switch_root GAGAL"
-die_shell
+
+mount -t tmpfs tmpfs /mnt/up
+mount -t overlay overlay -o "lowerdir=$LOWER,upperdir=/mnt/up,workdir=/mnt/wk" /mnt/newroot || die_shell
+
+# ── 6. Transisi ke GoboLinux ─────────────────────────────────────────────────
+p "pindah ke newroot..."
+mount --move /dev  /mnt/newroot/dev
+mount --move /proc /mnt/newroot/proc
+mount --move /sys  /mnt/newroot/sys
+
+# Pastikan init ada
+INIT="/sbin/init"
+[ -x "/mnt/newroot/System/Links/Executables/init" ] && INIT="/System/Links/Executables/init"
+
+exec switch_root /mnt/newroot "$INIT"
 
 INIT_EOF
 
@@ -906,17 +690,11 @@ pack_initrd() {
     info "init ada  : $([ -f "$INITRD_DIR/init" ] && echo YA || echo TIDAK)"
     info "busybox   : $([ -f "$INITRD_DIR/bin/busybox" ] && echo YA || echo TIDAK)"
 
-    # Pilih kompresi
-    local COMP_EXT COMP_CMD
-    if command -v zstd &>/dev/null; then
-        COMP_EXT="zst"
-        COMP_CMD="zstd -9 --long"
-        info "Kompresi: zstd"
-    else
-        COMP_EXT="xz"
-        COMP_CMD="xz -9 --check=crc32"
-        info "Kompresi: xz"
-    fi
+    # Porteus pakai xz --check=crc32 (bukan zstd)
+    # Format ini kompatibel dengan syslinux dan semua bootloader
+    local COMP_EXT="xz"
+    local COMP_CMD="xz -9 --check=crc32"
+    info "Kompresi: xz (Porteus-style)"
 
     # Pack main cpio ke file sementara (JANGAN pakai $() untuk binary data)
     local MAIN_COMP="$WORK/main.cpio.$COMP_EXT"
@@ -924,14 +702,16 @@ pack_initrd() {
     ( cd "$INITRD_DIR" && find . | sort | cpio -o -H newc --quiet 2>/dev/null )         | $COMP_CMD > "$MAIN_COMP"
     info "  main cpio: $(du -sh "$MAIN_COMP" | cut -f1)"
 
-    # Gabung: early (uncompressed) + main (compressed)
-    if [ -s "$WORK/early.cpio" ]; then
-        cat "$WORK/early.cpio" "$MAIN_COMP" > "$OUTPUT_INITRD"
-        info "Format: early($(du -sh "$WORK/early.cpio" | cut -f1)) + main"
-    else
-        cp "$MAIN_COMP" "$OUTPUT_INITRD"
-        info "Format: main only"
-    fi
+    # Format Porteus: cpio xz saja (tanpa early_cpio di depan)
+    # Porteus tidak pakai early_cpio/microcode — microcode diurus oleh kernel/firmware
+    # Jika ingin menyertakan microcode GoboLinux: aktifkan blok di bawah
+    cp "$MAIN_COMP" "$OUTPUT_INITRD"
+    info "Format: Porteus-style (xz cpio, tanpa early_cpio)"
+
+    # [OPSIONAL] Aktifkan jika ingin early_cpio microcode GoboLinux:
+    # if [ -s "$WORK/early.cpio" ]; then
+    #     cat "$WORK/early.cpio" "$MAIN_COMP" > "$OUTPUT_INITRD"
+    # fi
 
     log "  Output: $OUTPUT_INITRD ($(du -sh "$OUTPUT_INITRD" | cut -f1))"
 
@@ -983,15 +763,20 @@ main() {
     local extract_dir
     extract_dir=$(extract_gobo017_initrd "$initrd_file")
 
+    # Bangun base dari GoboLinux 017 main/ (kernel modules, libs, dll)
     build_from_gobo017_main "$extract_dir"
-    install_busybox_from_porteus
+
+    # Simpan early_cpio (microcode AMD/Intel)
     save_early_cpio "$extract_dir"
 
-    # Tahap 2b: Install BusyBox dari Porteus initrd
-    # (GoboLinux 017 initramfs tidak selalu punya BusyBox yang kompatibel)
+    # Install BusyBox dari Porteus initrd (lebih lengkap dari GoboLinux)
+    # Porteus BusyBox: statik, semua applet tersedia (mount, mknod, switch_root, dll)
     extract_busybox_from_porteus_initrd
 
+    # Tulis /init script Porteus-style
     write_init
+
+    # Pack menjadi initrd.xz
     pack_initrd
 
     echo ""
