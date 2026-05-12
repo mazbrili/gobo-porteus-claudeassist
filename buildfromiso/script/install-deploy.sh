@@ -1,6 +1,6 @@
 #!/bin/bash
-# install-to-usb.sh  — Instal GoboLinux-Porteus ke USB drive
-# make-iso.sh        — Buat file ISO bootable dari output/porteus-gobolinux/
+# install-to-usb.sh  — Instal GoboLinux-porteux ke USB drive
+# make-iso.sh        — Buat file ISO bootable dari output/porteux-gobolinux/
 #
 # Penggunaan:
 #   sudo bash install-to-usb.sh /dev/sdX
@@ -8,9 +8,10 @@
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-OUTPUT_DIR="$SCRIPT_DIR/../output/porteus-gobolinux"
+OUTPUT_DIR="$SCRIPT_DIR/../output/porteux-gobolinux"
 
 die()  { echo "ERROR: $*" >&2; exit 1; }
+warn() { echo "WARN: $*" >&2; }
 log()  { echo "[$(date +%H:%M:%S)] $*"; }
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -61,21 +62,21 @@ install_to_usb() {
     dd if=/usr/share/syslinux/mbr.bin   of="$device" bs=440 count=1 conv=notrunc 2>/dev/null || \
     warn "mbr.bin tidak ditemukan — boot MBR mungkin tidak berfungsi"
 
-    # Rename porteus.cfg ke syslinux.cfg untuk syslinux
-    [ -f "$mnt/boot/syslinux/porteus.cfg" ] && \
-        cp "$mnt/boot/syslinux/porteus.cfg" "$mnt/boot/syslinux/syslinux.cfg"
+    # Rename porteux.cfg ke syslinux.cfg untuk syslinux
+    [ -f "$mnt/boot/syslinux/porteux.cfg" ] && \
+        cp "$mnt/boot/syslinux/porteux.cfg" "$mnt/boot/syslinux/syslinux.cfg"
 
     sync
     log "Selesai! USB siap boot GoboLinux dari $device"
     log "Total ukuran:"
-    du -sh "$mnt/porteus/base/"*.xzm 2>/dev/null || true
+    du -sh "$mnt/porteux/base/"*.xzm 2>/dev/null || true
 }
 
 # ════════════════════════════════════════════════════════════════════════════
 # make-iso.sh
 # ════════════════════════════════════════════════════════════════════════════
 make_iso() {
-    local iso_out="${1:-$(dirname "$OUTPUT_DIR")/GoboLinux-Porteus-live.iso}"
+    local iso_out="${1:-$(dirname "$OUTPUT_DIR")/GoboLinux-porteux-live.iso}"
     command -v xorriso &>/dev/null || die "xorriso tidak ada: apt install xorriso"
 
     local vmlinuz="$OUTPUT_DIR/boot/syslinux/vmlinuz"
@@ -106,9 +107,9 @@ if [ -n "$isolinux_bin" ] && [ -f "$isolinux_bin" ]; then
             cp "$isolinux_bin" "$DEST_DIR/"
         fi
 
-        # Rename porteus.cfg -> isolinux.cfg
-        if [ -f "$DEST_DIR/porteus.cfg" ]; then
-            cp "$DEST_DIR/porteus.cfg" "$DEST_DIR/isolinux.cfg"
+        # Rename porteux.cfg -> isolinux.cfg
+        if [ -f "$DEST_DIR/porteux.cfg" ]; then
+            cp "$DEST_DIR/porteux.cfg" "$DEST_DIR/isolinux.cfg"
         fi
     fi
 
@@ -116,7 +117,7 @@ if [ -n "$isolinux_bin" ] && [ -f "$isolinux_bin" ]; then
         -iso-level 3 \
         -full-iso9660-filenames \
         -volid "GoboLinux-Live" \
-        -appid  "GoboLinux 017.01 Porteus-style" \
+        -appid  "GoboLinux 017.01 porteux-style" \
         -publisher "GoboLinux Community" \
         -preparer "build-gobo-live.sh" \
         \
