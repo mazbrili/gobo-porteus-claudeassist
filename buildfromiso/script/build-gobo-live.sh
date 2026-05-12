@@ -1,5 +1,5 @@
 #!/bin/bash
-# build-gobo-live.sh  —  GoboLinux 017.01  →  struktur folder Porteus
+# build-gobo-live.sh  —  GoboLinux 017.01  →  struktur folder porteux
 # ─────────────────────────────────────────────────────────────────────────────
 # Strategi: SCAN dulu isi ISO secara nyata, baru proses.
 # Tidak hardcode nama file apapun dari ISO GoboLinux.
@@ -9,15 +9,15 @@
 #   isolinux/initramfs   ← bukan initrd.xz, compressed zstd
 #   GoboLinux/GoboLinuxFS.squashfs  ← squashfs utama, compressed zstd
 #
-# Output Porteus-style:
-#   porteus-gobolinux/
+# Output porteux-style:
+#   porteux-gobolinux/
 #   ├── boot/syslinux/
 #   │   ├── vmlinuz          ← salin dari isolinux/kernel
 #   │   ├── initrd-gobo-orig ← salin dari isolinux/initramfs (asli)
-#   │   ├── initrd.xz        ← hasil modify-initrd.sh (dijalankan terpisah)
-#   │   └── porteus.cfg
+#   │   ├── initrd.zst        ← hasil modify-initrd.sh (dijalankan terpisah)
+#   │   └── porteux.cfg
 #   ├── EFI/
-#   └── porteus/
+#   └── porteux/
 #       ├── base/
 #       │   ├── 000-kernel.xzm
 #       │   ├── 001-base.xzm
@@ -37,9 +37,9 @@ CURRENT_MAP_FILE="gobo17.01-current.sh"
 set -euo pipefail
 
 GOBO_ISO="${1:-GoboLinux-017.01-x86_64.iso}"
-OUTPUT_DIR="${2:-$(cd "$(dirname "$0")/.." && pwd)/output/porteus-gobolinux}"
-PORTEUS_ISO="${PORTEUS_ISO:-}"   # Set via: PORTEUS_ISO=/path/to/porteus.iso make build
-BUSYBOX_FROM_PORTEUS=""         # Diisi oleh extract_syslinux_from_porteus()
+OUTPUT_DIR="${2:-$(cd "$(dirname "$0")/.." && pwd)/output/porteux-gobolinux}"
+PORTEUX_ISO="${PORTEUX_ISO:-}"   # Set via: PORTEUX_ISO=/path/to/porteux.iso make build
+BUSYBOX_FROM_porteux=""         # Diisi oleh extract_syslinux_from_porteux()
 WORK_DIR="${TMPDIR:-/tmp}/gobo-live-$$"
 # gobo-root disimpan di luar WORK_DIR agar tidak ikut dihapus trap
 GOBO_ROOT_DIR="${TMPDIR:-/tmp}/gobo-live-root-$$"
@@ -153,6 +153,7 @@ detect_initramfs() {
             "$WORK_DIR/iso/isolinux/initramfs" \
             "$WORK_DIR/iso/boot/isolinux/initramfs" \
             "$WORK_DIR/iso/isolinux/initrd" \
+            "$WORK_DIR/iso/isolinux/initrd.zst" \
             "$WORK_DIR/iso/boot/initrd.img"
         do
             [ -f "$candidate" ] && { found="$candidate"; break; }
@@ -183,53 +184,53 @@ detect_squashfs() {
 }
 
 
-# ── Ekstrak file syslinux dari ISO Porteus ────────────────────────────────────
-# Porteus ISO berisi semua file .c32, isolinux.bin, vesamenu.c32, dll
+# ── Ekstrak file syslinux dari ISO porteux ────────────────────────────────────
+# porteux ISO berisi semua file .c32, isolinux.bin, vesamenu.c32, dll
 # yang dibutuhkan untuk boot BIOS/Legacy.
-# Porteus diunduh dari: https://porteus.org/porteus-downloads.html
-extract_syslinux_from_porteus() {
+# porteux diunduh dari: https://porteux.org/porteux-downloads.html
+extract_syslinux_from_porteux() {
     local dst="$OUTPUT_DIR/boot/syslinux"
     mkdir -p "$dst"
 
-    # Cari Porteus ISO — dari argumen env atau scan direktori kerja
-    local porteus_iso="$PORTEUS_ISO"
-    if [ -z "$porteus_iso" ]; then
-        # Auto-detect: cari file Porteus*.iso di direktori script dan parent
+    # Cari porteux ISO — dari argumen env atau scan direktori kerja
+    local PORTEUX_ISO="$PORTEUX_ISO"
+    if [ -z "$PORTEUX_ISO" ]; then
+        # Auto-detect: cari file porteux*.iso di direktori script dan parent
         local script_dir
         script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-        for candidate in             "$script_dir"/../Porteus*.iso             "$script_dir"/../porteus*.iso             "$script_dir"/../../Porteus*.iso             "$(pwd)"/Porteus*.iso             "$(pwd)"/porteus*.iso
+        for candidate in             "$script_dir"/../porteux*.iso             "$script_dir"/../porteux*.iso             "$script_dir"/../../porteux*.iso             "$(pwd)"/porteux*.iso             "$(pwd)"/porteux*.iso
         do
             # Expand glob
             for f in $candidate; do
-                [ -f "$f" ] && { porteus_iso="$f"; break 2; }
+                [ -f "$f" ] && { PORTEUX_ISO="$f"; break 2; }
             done
         done
     fi
 
-    if [ -z "$porteus_iso" ] || [ ! -f "$porteus_iso" ]; then
-        warn "Porteus ISO tidak ditemukan — syslinux dari GoboLinux ISO saja"
-        warn "Untuk syslinux lengkap: PORTEUS_ISO=/path/to/porteus.iso make build"
-        warn "Unduh: https://porteus.org/porteus-downloads.html"
+    if [ -z "$PORTEUX_ISO" ] || [ ! -f "$PORTEUX_ISO" ]; then
+        warn "porteux ISO tidak ditemukan — syslinux dari GoboLinux ISO saja"
+        warn "Untuk syslinux lengkap: PORTEUX_ISO=/path/to/porteux.iso make build"
+        warn "Unduh: https://porteux.org/porteux-downloads.html"
         return 0
     fi
 
-    log "Ekstrak syslinux dari Porteus ISO: $porteus_iso"
+    log "Ekstrak syslinux dari porteux ISO: $PORTEUX_ISO"
 
-    local porteus_mnt="$WORK_DIR/porteus-mnt"
-    mkdir -p "$porteus_mnt"
-    mount -o loop,ro "$porteus_iso" "$porteus_mnt" || {
-        warn "Gagal mount Porteus ISO: $porteus_iso"
+    local porteux_mnt="$WORK_DIR/porteux-mnt"
+    mkdir -p "$porteux_mnt"
+    mount -o loop,ro "$PORTEUX_ISO" "$porteux_mnt" || {
+        warn "Gagal mount porteux ISO: $PORTEUX_ISO"
         return 0
     }
 
-    # Tampilkan isi boot/ Porteus untuk referensi
-    log "  Isi boot/ Porteus:"
-    find "$porteus_mnt/boot" -maxdepth 2 2>/dev/null | sort | while read -r f; do
-        local rel="${f#$porteus_mnt}"
+    # Tampilkan isi boot/ porteux untuk referensi
+    log "  Isi boot/ porteux:"
+    find "$porteux_mnt/boot" -maxdepth 2 2>/dev/null | sort | while read -r f; do
+        local rel="${f#$porteux_mnt}"
         [ -d "$f" ] && log "    DIR $rel/" ||             log "    $(du -sh "$f" 2>/dev/null | cut -f1)  $rel"
     done
 
-    # File yang dicari dari Porteus:
+    # File yang dicari dari porteux:
     # - isolinux.bin     : bootloader binary
     # - vesamenu.c32     : menu grafis
     # - menu.c32         : menu teks
@@ -243,15 +244,15 @@ extract_syslinux_from_porteus() {
     # - isohdpfx.bin     : untuk isohybrid (USB boot)
 
     local copied=0 skipped=0
-    for isodir in         "$porteus_mnt/boot/syslinux"         "$porteus_mnt/boot/isolinux"         "$porteus_mnt/syslinux"         "$porteus_mnt/isolinux"
+    for isodir in         "$porteux_mnt/boot/syslinux"         "$porteux_mnt/boot/isolinux"         "$porteux_mnt/syslinux"         "$porteux_mnt/isolinux"
     do
         [ -d "$isodir" ] || continue
-        log "  Salin dari: ${isodir#$porteus_mnt}"
+        log "  Salin dari: ${isodir#$porteux_mnt}"
         find "$isodir" -maxdepth 1 -type f | while read -r f; do
             local bn="${f##*/}"
-            # Lewati file boot Porteus sendiri (kernel, initrd, porteus.cfg)
+            # Lewati file boot porteux sendiri (kernel, initrd, porteux.cfg)
             case "$bn" in
-                vmlinuz|kernel|initrd*|initramfs*|porteus.cfg|syslinux.cfg) continue ;;
+                vmlinuz|kernel|initrd*|initramfs*|porteux.cfg|syslinux.cfg) continue ;;
             esac
             # Salin ke dst, jangan timpa jika sudah ada dari GoboLinux ISO
             if [ ! -f "$dst/$bn" ]; then
@@ -265,42 +266,42 @@ extract_syslinux_from_porteus() {
     done
 
     # Khusus: salin isohdpfx.bin untuk isohybrid (USB dd boot)
-    for candidate in         "$porteus_mnt/boot/syslinux/isohdpfx.bin"         "$porteus_mnt/boot/isolinux/isohdpfx.bin"
+    for candidate in         "$porteux_mnt/boot/syslinux/isohdpfx.bin"         "$porteux_mnt/boot/isolinux/isohdpfx.bin"
     do
         [ -f "$candidate" ] && cp "$candidate" "$dst/isohdpfx.bin" &&             info "    + isohdpfx.bin (isohybrid)" && break
     done
 
-    # Simpan Porteus initrd.xz ke output agar build-initrd.sh bisa auto-detect BusyBox
-    for candidate in         "$porteus_mnt/boot/syslinux/initrd.xz"         "$porteus_mnt/boot/isolinux/initrd.xz"         "$porteus_mnt/boot/syslinux/initrd.img"         "$porteus_mnt/porteus/boot/initrd.xz"
+    # Simpan porteux initrd.xz ke output agar build-initrd.sh bisa auto-detect BusyBox
+    for candidate in         "$porteux_mnt/boot/syslinux/initrd.xz"         "$porteux_mnt/boot/isolinux/initrd.xz"         "$porteux_mnt/boot/syslinux/initrd.img"         "$porteux_mnt/porteux/boot/initrd.xz"
     do
         [ -f "$candidate" ] || continue
-        local porteus_initrd_dst="$OUTPUT_DIR/boot/syslinux/porteus-initrd.xz"
-        cp "$candidate" "$porteus_initrd_dst"
-        info "  Porteus initrd disimpan: ${candidate#$porteus_mnt} → boot/syslinux/porteus-initrd.xz"
-        info "    ($(du -sh "$porteus_initrd_dst" | cut -f1)) — berisi BusyBox untuk build-initrd.sh"
+        local porteux_initrd_dst="$OUTPUT_DIR/boot/syslinux/porteux-initrd.xz"
+        cp "$candidate" "$porteux_initrd_dst"
+        info "  porteux initrd disimpan: ${candidate#$porteux_mnt} → boot/syslinux/porteux-initrd.xz"
+        info "    ($(du -sh "$porteux_initrd_dst" | cut -f1)) — berisi BusyBox untuk build-initrd.sh"
         break
     done
 
-    # ── Ekstrak BusyBox dari initrd.xz Porteus ─────────────────────────────────
-    # Porteus initrd.xz berisi BusyBox statik yang dikompilasi dengan applet
+    # ── Ekstrak BusyBox dari initrd.xz porteux ─────────────────────────────────
+    # porteux initrd.xz berisi BusyBox statik yang dikompilasi dengan applet
     # lengkap — jauh lebih baik dari BusyBox GoboLinux yang mungkin tidak ada
-    log "  Ekstrak BusyBox dari Porteus initrd.xz..."
-    local porteus_initrd=""
-    for candidate in         "$porteus_mnt/boot/syslinux/initrd.xz"         "$porteus_mnt/boot/syslinux/initrd.img"         "$porteus_mnt/boot/initrd.xz"
+    log "  Ekstrak BusyBox dari porteux initrd.xz..."
+    local porteux_initrd=""
+    for candidate in         "$porteux_mnt/boot/syslinux/initrd.xz"         "$porteux_mnt/boot/syslinux/initrd.img"         "$porteux_mnt/boot/initrd.xz"         "$porteux_mnt/boot/syslinux/initrd.zst"
     do
-        [ -f "$candidate" ] && { porteus_initrd="$candidate"; break; }
+        [ -f "$candidate" ] && { porteux_initrd="$candidate"; break; }
     done
 
-    if [ -n "$porteus_initrd" ]; then
-        local bb_extract="$WORK_DIR/porteus-initrd-extract"
+    if [ -n "$porteux_initrd" ]; then
+        local bb_extract="$WORK_DIR/porteux-initrd-extract"
         mkdir -p "$bb_extract"
-        log "    Initrd Porteus: ${porteus_initrd#$porteus_mnt} ($(du -sh "$porteus_initrd" | cut -f1))"
-        log "    Format: $(file -b "$porteus_initrd" | cut -c1-50)"
+        log "    Initrd porteux: ${porteux_initrd#$porteux_mnt} ($(du -sh "$porteux_initrd" | cut -f1))"
+        log "    Format: $(file -b "$porteux_initrd" | cut -c1-50)"
 
-        # Ekstrak cpio — Porteus memakai xz
-        (cd "$bb_extract" &&             xzcat "$porteus_initrd" 2>/dev/null | cpio -id --quiet 2>/dev/null) ||         (cd "$bb_extract" &&             zcat  "$porteus_initrd" 2>/dev/null | cpio -id --quiet 2>/dev/null) || true
+        # Ekstrak cpio — porteux memakai xz
+        (cd "$bb_extract" &&             xzcat "$porteux_initrd" 2>/dev/null | cpio -id --quiet 2>/dev/null) ||         (cd "$bb_extract" &&             zcat  "$porteux_initrd" 2>/dev/null | cpio -id --quiet 2>/dev/null) || true
 
-        # Cari busybox di dalam initrd Porteus
+        # Cari busybox di dalam initrd porteux
         local bb_found=""
         for candidate in             "$bb_extract/bin/busybox"             "$bb_extract/usr/bin/busybox"             "$bb_extract/busybox"
         do
@@ -312,30 +313,30 @@ extract_syslinux_from_porteus() {
 
         if [ -n "$bb_found" ]; then
             # Simpan ke WORK_DIR agar build-initrd.sh bisa menggunakannya
-            cp "$bb_found" "$WORK_DIR/busybox-from-porteus"
-            chmod +x "$WORK_DIR/busybox-from-porteus"
-            BUSYBOX_FROM_PORTEUS="$WORK_DIR/busybox-from-porteus"
-            log "    BusyBox Porteus: $(du -sh "$BUSYBOX_FROM_PORTEUS" | cut -f1)"
-            log "    Format: $(file -b "$BUSYBOX_FROM_PORTEUS" | cut -c1-60)"
+            cp "$bb_found" "$WORK_DIR/busybox-from-porteux"
+            chmod +x "$WORK_DIR/busybox-from-porteux"
+            BUSYBOX_FROM_porteux="$WORK_DIR/busybox-from-porteux"
+            log "    BusyBox porteux: $(du -sh "$BUSYBOX_FROM_porteux" | cut -f1)"
+            log "    Format: $(file -b "$BUSYBOX_FROM_porteux" | cut -c1-60)"
 
             # Simpan path ke file agar build-initrd.sh bisa temukan
-            echo "$BUSYBOX_FROM_PORTEUS" > "$(dirname "$OUTPUT_DIR")/.busybox-path"
+            echo "$BUSYBOX_FROM_porteux" > "$(dirname "$OUTPUT_DIR")/.busybox-path"
             log "    Path disimpan: $(dirname "$OUTPUT_DIR")/.busybox-path"
         else
-            warn "    BusyBox tidak ditemukan di initrd Porteus"
-            log "    Isi initrd Porteus:"
+            warn "    BusyBox tidak ditemukan di initrd porteux"
+            log "    Isi initrd porteux:"
             find "$bb_extract" -maxdepth 2 | head -20 | while read -r f; do
                 log "      ${f#$bb_extract/}"
             done
         fi
         rm -rf "$bb_extract"
     else
-        warn "  initrd.xz Porteus tidak ditemukan di boot/syslinux/"
+        warn "  initrd.xz porteux tidak ditemukan di boot/syslinux/"
     fi
 
-    umount "$porteus_mnt" 2>/dev/null || true
+    umount "$porteux_mnt" 2>/dev/null || true
 
-    log "  Syslinux dari Porteus: $copied file disalin, $skipped sudah ada"
+    log "  Syslinux dari porteux: $copied file disalin, $skipped sudah ada"
 
     # Verifikasi file kritis
     local critical_ok=1
@@ -347,7 +348,7 @@ extract_syslinux_from_porteus() {
             critical_ok=0
         fi
     done
-    [ "$critical_ok" = "1" ] && log "  Semua file syslinux kritis tersedia" ||         warn "  Beberapa file kritis tidak ada — coba ISO Porteus yang berbeda"
+    [ "$critical_ok" = "1" ] && log "  Semua file syslinux kritis tersedia" ||         warn "  Beberapa file kritis tidak ada — coba ISO porteux yang berbeda"
 }
 
 # ── Setup boot files ──────────────────────────────────────────────────────────
@@ -565,7 +566,7 @@ build_000_kernel() {
         fi
     fi
 
-    make_xzm "$staging" "$OUTPUT_DIR/porteus/base/000-kernel.xzm" "000-kernel.xzm"
+    make_xzm "$staging" "$OUTPUT_DIR/porteux/base/000-kernel.xzm" "000-kernel.xzm"
 }
 
 # ── 001-base.xzm ──────────────────────────────────────────────────────────────
@@ -602,7 +603,7 @@ build_001_base() {
     # Salin System Files esensial lainnya
     cp -a "$WORK_DIR/gobo-root/System/Settings/." "$staging/System/Settings/" 2>/dev/null || true
     
-    make_xzm "$staging" "$OUTPUT_DIR/porteus/base/001-base.xzm" "001-base.xzm"
+    make_xzm "$staging" "$OUTPUT_DIR/porteux/base/001-base.xzm" "001-base.xzm"
 }
 
 # ── 002-gobotool.xzm ─────────────────────────────────────────────────────────────
@@ -627,7 +628,7 @@ build_002_gobotool() {
     done
     [ "$count" -eq 0 ] && warn "Tidak ada gobo-tools ditemukan"
 
-    make_xzm "$staging" "$OUTPUT_DIR/porteus/base/002-gobotool.xzm" "002-gobotool.xzm"
+    make_xzm "$staging" "$OUTPUT_DIR/porteux/base/002-gobotool.xzm" "002-gobotool.xzm"
 }
 
 # ── 003-xorg.xzm ─────────────────────────────────────────────────────────────
@@ -656,7 +657,7 @@ build_003_xorg() {
     done
     [ "$count" -eq 0 ] && warn "Tidak ada paket Xorg ditemukan"
 
-    make_xzm "$staging" "$OUTPUT_DIR/porteus/base/003-xorg.xzm" "003-xorg.xzm"
+    make_xzm "$staging" "$OUTPUT_DIR/porteux/base/003-xorg.xzm" "003-xorg.xzm"
 }
 
 # ── 004-desktop.xzm ───────────────────────────────────────────────────────────
@@ -686,7 +687,7 @@ build_004_desktop() {
     done
     [ "$count" -eq 0 ] && warn "Tidak ada paket desktop ditemukan"
 
-    make_xzm "$staging" "$OUTPUT_DIR/porteus/base/004-desktop.xzm" "004-desktop.xzm"
+    make_xzm "$staging" "$OUTPUT_DIR/porteux/base/004-desktop.xzm" "004-desktop.xzm"
 }
 # ── 005-dev.xzm ───────────────────────────────────────────────────────────
 # ── List Program Modul 005-dev ────────────────────────────────────────────────
@@ -732,7 +733,7 @@ build_005_dev() {
     
     # Tambahkan symlink linker untuk dev
     if [ "$count" -gt 0 ]; then
-        make_xzm "$staging" "$OUTPUT_DIR/porteus/optional/05-dev.xzm" "05-dev.xzm"
+        make_xzm "$staging" "$OUTPUT_DIR/porteux/optional/05-dev.xzm" "05-dev.xzm"
     else
         warn "Modul dev kosong, tidak dibuat."
     fi
@@ -762,38 +763,38 @@ EOF
     
     chmod +x "$WORK_DIR/$CURRENT_MAP_FILE"
 }
-# ── porteus.cfg & grub.cfg ─────────────────────────────────────────────────────
+# ── porteux.cfg & grub.cfg ─────────────────────────────────────────────────────
 create_boot_config() {
-    log "Membuat porteus.cfg dan grub.cfg..."
+    log "Membuat porteux.cfg dan grub.cfg..."
 
-    cat > "$OUTPUT_DIR/boot/syslinux/porteus.cfg" << 'SYSLINUX_EOF'
-# GoboLinux 017.01 Live  —  Porteus-style boot config
+    cat > "$OUTPUT_DIR/boot/syslinux/porteux.cfg" << 'SYSLINUX_EOF'
+# GoboLinux 017.01 Live  —  porteux-style boot config
 PROMPT 0
 TIMEOUT 90
 DEFAULT graphics
 
 UI vesamenu.c32
-MENU TITLE  GoboLinux 017.01 Live  [Porteus-style]
+MENU TITLE  GoboLinux 017.01 Live  [porteux-style]
 
 LABEL graphics
   MENU LABEL  GoboLinux — Graphical (AwesomeWM)
   KERNEL /boot/syslinux/vmlinuz
-  APPEND initrd=/boot/syslinux/initrd.xz from=/porteus changes=/porteus/changes quiet splash
+  APPEND initrd=/boot/syslinux/initrd.xz from=/porteux changes=/porteux/changes quiet splash
 
 LABEL text
   MENU LABEL  GoboLinux — Text Mode
   KERNEL /boot/syslinux/vmlinuz
-  APPEND initrd=/boot/syslinux/initrd.xz from=/porteus changes=/porteus/changes 3
+  APPEND initrd=/boot/syslinux/initrd.xz from=/porteux changes=/porteux/changes 3
 
 LABEL copy2ram
   MENU LABEL  GoboLinux — Copy to RAM (~2GB RAM needed)
   KERNEL /boot/syslinux/vmlinuz
-  APPEND initrd=/boot/syslinux/initrd.xz from=/porteus changes=/porteus/changes copy2ram
+  APPEND initrd=/boot/syslinux/initrd.xz from=/porteux changes=/porteux/changes copy2ram
 
 LABEL fresh
   MENU LABEL  GoboLinux — Always Fresh (no save)
   KERNEL /boot/syslinux/vmlinuz
-  APPEND initrd=/boot/syslinux/initrd.xz from=/porteus nomagic
+  APPEND initrd=/boot/syslinux/initrd.xz from=/porteux nomagic
 
 LABEL reboot
   MENU LABEL  Reboot
@@ -810,22 +811,22 @@ set default=0
 set timeout=9
 menuentry "GoboLinux Graphical (AwesomeWM)" {
     search -f /boot/syslinux/vmlinuz --set=root
-    linux  /boot/syslinux/vmlinuz from=/porteus changes=/porteus/changes quiet splash
+    linux  /boot/syslinux/vmlinuz from=/porteux changes=/porteux/changes quiet splash
     initrd /boot/syslinux/initrd.xz
 }
 menuentry "GoboLinux Text Mode" {
     search -f /boot/syslinux/vmlinuz --set=root
-    linux  /boot/syslinux/vmlinuz from=/porteus changes=/porteus/changes 3
+    linux  /boot/syslinux/vmlinuz from=/porteux changes=/porteux/changes 3
     initrd /boot/syslinux/initrd.xz
 }
 menuentry "GoboLinux Copy to RAM" {
     search -f /boot/syslinux/vmlinuz --set=root
-    linux  /boot/syslinux/vmlinuz from=/porteus changes=/porteus/changes copy2ram
+    linux  /boot/syslinux/vmlinuz from=/porteux changes=/porteux/changes copy2ram
     initrd /boot/syslinux/initrd.xz
 }
 menuentry "GoboLinux Always Fresh" {
     search -f /boot/syslinux/vmlinuz --set=root
-    linux  /boot/syslinux/vmlinuz from=/porteus nomagic
+    linux  /boot/syslinux/vmlinuz from=/porteux nomagic
     initrd /boot/syslinux/initrd.xz
 }
 menuentry "Reboot"   { reboot }
@@ -845,7 +846,7 @@ show_summary() {
     echo "File yang dihasilkan:"
     find "$OUTPUT_DIR" \
         \( -name "*.xzm" -o -name "vmlinuz" -o -name "initrd*" \
-           -o -name "porteus.cfg" -o -name "grub.cfg" \) \
+           -o -name "porteux.cfg" -o -name "grub.cfg" \) \
         2>/dev/null | sort | while read -r f; do
         printf "  %-10s  %s\n" "$(du -sh "$f" | cut -f1)" "${f#$OUTPUT_DIR/}"
     done
@@ -868,7 +869,7 @@ show_summary() {
 main() {
     check_deps
 
-    log "GoboLinux → Porteus-style Live Builder"
+    log "GoboLinux → porteux-style Live Builder"
     log "ISO    : $GOBO_ISO"
     log "Output : $OUTPUT_DIR"
     log "Kompresi modul: $COMP | Block: $BLOCK_SIZE"
@@ -880,10 +881,10 @@ main() {
     mkdir -p \
         "$OUTPUT_DIR/boot/syslinux" \
         "$OUTPUT_DIR/EFI/boot" \
-        "$OUTPUT_DIR/porteus/base" \
-        "$OUTPUT_DIR/porteus/modules" \
-        "$OUTPUT_DIR/porteus/optional" \
-        "$OUTPUT_DIR/porteus/changes"
+        "$OUTPUT_DIR/porteux/base" \
+        "$OUTPUT_DIR/porteux/modules" \
+        "$OUTPUT_DIR/porteux/optional" \
+        "$OUTPUT_DIR/porteux/changes"
 
     # 1. Scan ISO — tampilkan semua file sebenarnya
     scan_iso
@@ -907,8 +908,8 @@ main() {
     # 3. Salin boot files
     setup_boot "$KERNEL_SRC" "$INITRAMFS_SRC"
 
-    # 3b. Lengkapi syslinux dari Porteus ISO (lebih lengkap dari GoboLinux)
-    extract_syslinux_from_porteus
+    # 3b. Lengkapi syslinux dari porteux ISO (lebih lengkap dari GoboLinux)
+    extract_syslinux_from_porteux
 
     # 4. Ekstrak squashfs
     extract_squashfs "$SQUASHFS_SRC"
