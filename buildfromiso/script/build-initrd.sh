@@ -1,7 +1,7 @@
 #!/bin/bash
 # build-initrd.sh
 # ─────────────────────────────────────────────────────────────────────────────
-# Membangun initramfs untuk GoboLinux 017 Live (Porteus-style)
+# Membangun initramfs untuk GoboLinux 017 Live (Porteux-style)
 #
 # STRATEGI BARU (berdasarkan temuan):
 #   GoboLinux 017 initramfs bisa diekstrak dengan unmkinitramfs dan berisi:
@@ -11,18 +11,18 @@
 #               bin/busybox, sbin/*, lib/*, dll
 #
 #   Kita GUNAKAN main/ dari initramfs GoboLinux 017 sebagai base,
-#   lalu GANTI /init-nya dengan init kita yang mount .xzm Porteus-style.
+#   lalu GANTI /init-nya dengan init kita yang mount .xzm Porteux-style.
 #   BusyBox dan semua modul kernel sudah ada di dalamnya.
 #
 # Usage:
 #   sudo bash build-initrd.sh \
 #     --gobo017initrd /path/to/initramfs-gobo-orig \
-#     --porteus-initrd /path/to/porteus/boot/syslinux/initrd.xz \
+#     --porteux-initrd /path/to/porteux/boot/syslinux/initrd.xz \
 #     --output        /path/to/initrd.xz
 #
-# --porteus-initrd: initrd.xz dari ISO Porteus — sumber BusyBox statik.
-#   Porteus memakai BusyBox statik dengan semua applet lengkap.
-#   Jika tidak disediakan, script mencari di PORTEUS_INITRD env atau auto-detect.
+# --porteux-initrd: initrd.xz dari ISO Porteux — sumber BusyBox statik.
+#   Porteux memakai BusyBox statik dengan semua applet lengkap.
+#   Jika tidak disediakan, script mencari di PORTEUX_INITRD env atau auto-detect.
 #
 # Optional (backward compat, diabaikan):
 #   --gobo016  GoboLinux-016.iso
@@ -35,7 +35,7 @@ set -euo pipefail
 # ── Parse argumen ─────────────────────────────────────────────────────────────
 GOBO017_INITRD=""
 OUTPUT_INITRD=""
-PORTEUS_INITRD="${PORTEUS_INITRD:-}"  # initrd.xz Porteus untuk BusyBox
+PORTEUX_INITRD="${PORTEUX_INITRD:-}"  # initrd.xz porteux untuk BusyBox
 # Argumen lama tetap diterima tapi diabaikan (backward compat)
 GOBO016_ISO=""
 SLAX_ISO=""
@@ -46,7 +46,7 @@ while [ $# -gt 0 ]; do
         --gobo017initrd) GOBO017_INITRD="$2"; shift 2 ;;
         --output)        OUTPUT_INITRD="$2";  shift 2 ;;
         # Backward compat — diabaikan
-        --porteus-initrd) PORTEUS_INITRD="$2"; shift 2 ;;
+        --porteux-initrd) PORTEUX_INITRD="$2"; shift 2 ;;
         --gobo016)       GOBO016_ISO="$2";    shift 2 ;;
         --slax)          SLAX_ISO="$2";       shift 2 ;;
         --gobo017root)   GOBO017_ROOT="$2";   shift 2 ;;
@@ -281,31 +281,55 @@ build_from_gobo017_main() {
     log "  Menyalin filesystem GoboLinux 017..."
     mkdir -p "$INITRD_DIR"
     cp -a "$main_dir/." "$INITRD_DIR/"
-    # --- TAMBAHAN LOGIKA DEKOMPRESI MODUL ---
-    log "  Memeriksa kompresi modul kernel (.zst)..."
-    local kver_path
-    kver_path=$(find "$INITRD_DIR" -path "*/lib/modules/*" -type d -maxdepth 1 | head -1)
-    
-    if [ -d "$kver_path" ]; then
+    # --- Dekompresi modul kernel .ko.zst dan regenerasi modules.dep ---
+    log "  Memeriksa kompresi modul kernel (.ko.zst)..."
+    # Cari direktori kver: INITRD_DIR/lib/modules/<kver>/
+    local kver_path=""
+    if [ -d "$INITRD_DIR/lib/modules" ]; then
+        kver_path=$(find "$INITRD_DIR/lib/modules" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)
+    else
+        # GoboLinux: modules di Programs/Linux/<ver>/lib/modules/<kver>
+        kver_path=$(find "$INITRD_DIR" -path "*/Programs/Linux/*/lib/modules/*" \
+                    -mindepth 5 -maxdepth 6 -type d 2>/dev/null | sort -V | tail -1)
+    fi
+
+    if [ -n "$kver_path" ] && [ -d "$kver_path" ]; then
         local kver; kver=$(basename "$kver_path")
-        info "  Dekompresi modul untuk kernel: $kver"
-        
-        # Cari file .zst, dekompresi, lalu hapus aslinya
-        if command -v zstd &>/dev/null; then
-            find "$kver_path" -name "*.ko.zst" -exec zstd -d --rm {} \; 2>/dev/null || true
-            info "  Dekompresi selesai (.ko.zst -> .ko)"
-            
-            # UPDATE modules.dep
-            # Ini sangat penting agar modprobe tidak mencari file .zst yang sudah hilang
-            if command -v depmod &>/dev/null; then
-                info "  Memperbarui modules.dep..."
-                depmod -b "$INITRD_DIR" "$kver"
+        info "  Direktori modules: $kver_path"
+        info "  Kernel versi: $kver"
+        local zst_count
+        zst_count=$(find "$kver_path" -name "*.ko.zst" 2>/dev/null | wc -l)
+        info "  .ko.zst ditemukan: $zst_count"
+
+        if [ "$zst_count" -gt 0 ]; then
+            if command -v zstd &>/dev/null; then
+                log "  Dekompresi $zst_count file .ko.zst..."
+                find "$kver_path" -name "*.ko.zst" | while read -r f; do
+                    zstd -d --rm "$f" 2>/dev/null || true
+                done
+                info "  Dekompresi selesai (.ko.zst → .ko)"
             else
-                warn "  depmod tidak ditemukan di host, modules.dep mungkin tidak akurat!"
+                warn "  zstd tidak ada di host — .ko.zst tidak bisa didekompresi!"
             fi
-        else
-            warn "  zstd tidak ditemukan di host! Modul tetap dalam format .zst (berisiko gagal boot)."
         fi
+
+        # Regenerasi modules.dep dengan base yang benar
+        # depmod -b BASE KVER: BASE = root initrd, KVER = versi kernel
+        if command -v depmod &>/dev/null; then
+            local depmod_base="$INITRD_DIR"
+            # Jika modules di Programs/Linux, base harus parent dari lib/
+            if echo "$kver_path" | grep -q "Programs/Linux"; then
+                depmod_base=$(echo "$kver_path" | sed "s|/lib/modules/$kver||")
+            fi
+            info "  Regenerasi modules.dep: depmod -b $depmod_base $kver"
+            depmod -b "$depmod_base" "$kver" 2>/dev/null && \
+                info "  modules.dep diperbarui" || \
+                warn "  depmod gagal — modprobe mungkin tidak bekerja"
+        else
+            warn "  depmod tidak ada di host — modules.dep tidak diperbarui"
+        fi
+    else
+        info "  Tidak ada direktori modules ditemukan (kernel mungkin monolitik)"
     fi
     # ----------------------------------------
     # Pastikan direktori wajib ada
@@ -373,69 +397,69 @@ save_early_cpio() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TAHAP 2b: Ekstrak BusyBox dari initrd.xz Porteus
-# Porteus initrd.xz berisi BusyBox statik yang dikompilasi dengan semua
+# TAHAP 2b: Ekstrak BusyBox dari initrd.xz porteux
+# porteux initrd.xz berisi BusyBox statik yang dikompilasi dengan semua
 # applet yang dibutuhkan (mount, mknod, switch_root, sleep, dll).
 # Ini menggantikan BusyBox dari GoboLinux yang mungkin tidak ada.
 # ─────────────────────────────────────────────────────────────────────────────
-extract_busybox_from_porteus_initrd() {
-    log "=== Ekstrak BusyBox dari Porteus initrd ==="
+extract_busybox_from_PORTEUX_INITRD() {
+    log "=== Ekstrak BusyBox dari porteux initrd ==="
 
-    # Resolve path initrd Porteus
-    local porteus_initrd="$PORTEUS_INITRD"
+    # Resolve path initrd porteux
+    local PORTEUX_INITRD="$PORTEUX_INITRD"
 
-    # Auto-detect: cari initrd.xz Porteus di lokasi standar output build
-    if [ -z "$porteus_initrd" ]; then
+    # Auto-detect: cari initrd.xz porteux di lokasi standar output build
+    if [ -z "$PORTEUX_INITRD" ]; then
         local output_syslinux
         output_syslinux="$(dirname "$OUTPUT_INITRD")"
-        for candidate in             "$output_syslinux/porteus-initrd.xz"             "$output_syslinux/../../../boot/syslinux/initrd.xz.porteus"
+        for candidate in             "$output_syslinux/porteux-initrd.xz"             "$output_syslinux/../../../boot/syslinux/initrd.xz.porteux"
         do
-            [ -f "$candidate" ] && { porteus_initrd="$candidate"; break; }
+            [ -f "$candidate" ] && { PORTEUX_INITRD="$candidate"; break; }
         done
     fi
 
-    if [ -z "$porteus_initrd" ] || [ ! -f "$porteus_initrd" ]; then
-        warn "Porteus initrd tidak ditemukan — BusyBox tidak diinstall"
-        warn "Gunakan: --porteus-initrd /path/to/porteus/initrd.xz"
-        warn "Atau set: PORTEUS_INITRD=/path make initrd"
+    if [ -z "$PORTEUX_INITRD" ] || [ ! -f "$PORTEUX_INITRD" ]; then
+        warn "porteux initrd tidak ditemukan — BusyBox tidak diinstall"
+        warn "Gunakan: --porteux-initrd /path/to/porteux/initrd.xz"
+        warn "Atau set: PORTEUX_INITRD=/path make initrd"
         return 0
     fi
 
-    log "  Porteus initrd: $porteus_initrd"
-    log "  Format: $(file -b "$porteus_initrd" | cut -c1-60)"
-    log "  Ukuran: $(du -sh "$porteus_initrd" | cut -f1)"
+    log "  porteux initrd: $PORTEUX_INITRD"
+    log "  Format: $(file -b "$PORTEUX_INITRD" | cut -c1-60)"
+    log "  Ukuran: $(du -sh "$PORTEUX_INITRD" | cut -f1)"
 
     # Ekstrak ke direktori sementara
-    local porteus_extract="$WORK/porteus-initrd-extract"
-    mkdir -p "$porteus_extract"
+    local porteux_extract="$WORK/porteux-initrd-extract"
+    mkdir -p "$porteux_extract"
 
     local fmt
-    fmt=$(file -b "$porteus_initrd")
+    fmt=$(file -b "$PORTEUX_INITRD")
 
-    log "  Mengekstrak Porteus initrd..."
+    log "  Mengekstrak porteux initrd..."
     if echo "$fmt" | grep -qi "XZ"; then
-        xzcat "$porteus_initrd" | cpio -id --quiet -D "$porteus_extract" 2>/dev/null || true
+        xzcat "$PORTEUX_INITRD" | cpio -id --quiet -D "$porteux_extract" 2>/dev/null || true
     elif echo "$fmt" | grep -qi "gzip"; then
-        zcat "$porteus_initrd" | cpio -id --quiet -D "$porteus_extract" 2>/dev/null || true
+        zcat "$PORTEUX_INITRD" | cpio -id --quiet -D "$porteux_extract" 2>/dev/null || true
     elif echo "$fmt" | grep -qi "Zstandard"; then
-        zstdcat "$porteus_initrd" | cpio -id --quiet -D "$porteus_extract" 2>/dev/null || true
+        zstdcat "$PORTEUX_INITRD" | cpio -id --quiet -D "$porteux_extract" 2>/dev/null || true
     else
         # Coba semua format
-        xzcat   "$porteus_initrd" 2>/dev/null | cpio -id --quiet -D "$porteus_extract" 2>/dev/null ||         zcat    "$porteus_initrd" 2>/dev/null | cpio -id --quiet -D "$porteus_extract" 2>/dev/null ||         zstdcat "$porteus_initrd" 2>/dev/null | cpio -id --quiet -D "$porteus_extract" 2>/dev/null ||         { warn "Gagal mengekstrak Porteus initrd"; return 0; }
+        xzcat   "$PORTEUX_INITRD" 2>/dev/null | cpio -id --quiet -D "$porteux_extract" 2>/dev/null ||         zcat    "$PORTEUX_INITRD" 2>/dev/null | cpio -id --quiet -D "$porteux_extract" 2>/dev/null ||         zstdcat "$PORTEUX_INITRD" 2>/dev/null | cpio -id --quiet -D "$porteux_extract" 2>/dev/null ||         { warn "Gagal mengekstrak porteux initrd"; return 0; }
     fi
 
-    log "  Isi Porteus initrd (top level):"
-    ls "$porteus_extract/" 2>/dev/null | while read -r d; do info "    $d"; done
+    log "  Isi porteux initrd (top level):"
+    ls "$porteux_extract/" 2>/dev/null | while read -r d; do info "    $d"; done
 
     # Cari binary busybox
     local bb_src=""
-    for candidate in         "$porteus_extract/bin/busybox"         "$porteus_extract/usr/bin/busybox"         "$porteus_extract/busybox"
+    for candidate in         "$porteux_extract/bin/busybox"         "$porteux_extract/usr/bin/busybox"         "$porteux_extract/busybox"
     do
         [ -f "$candidate" ] || continue
         local ftype; ftype=$(file -b "$candidate")
         if echo "$ftype" | grep -qi "ELF"; then
             bb_src="$candidate"
-            info "  BusyBox ditemukan: ${candidate#$porteus_extract/}"
+            info "  BusyBox ditemukan: ${candidate#$porteux_extract/}"
             info "    $(file -b "$candidate" | cut -c1-60)"
             info "    Ukuran: $(du -sh "$candidate" | cut -f1)"
             break
@@ -443,10 +467,10 @@ extract_busybox_from_porteus_initrd() {
     done
 
     if [ -z "$bb_src" ]; then
-        warn "  BusyBox tidak ditemukan dalam Porteus initrd"
+        warn "  BusyBox tidak ditemukan dalam porteux initrd"
         # Tampilkan isi bin/ untuk diagnosis
-        log "  Isi bin/ Porteus initrd:"
-        ls "$porteus_extract/bin/" 2>/dev/null | while read -r f; do info "    $f"; done
+        log "  Isi bin/ porteux initrd:"
+        ls "$porteux_extract/bin/" 2>/dev/null | while read -r f; do info "    $f"; done
         return 0
     fi
 
@@ -482,7 +506,7 @@ extract_busybox_from_porteus_initrd() {
 
     # Salin juga lib yang dibutuhkan BusyBox jika dynamic
     if echo "$(file -b "$bb_src")" | grep -qi "dynamically linked"; then
-        warn "  BusyBox Porteus adalah dynamic linked — menyalin shared libraries..."
+        warn "  BusyBox porteux adalah dynamic linked — menyalin shared libraries..."
         ldd "$bb_src" 2>/dev/null | grep -o '/[^ ]*' | while read -r lib; do
             [ -f "$lib" ] || continue
             local libdir; libdir="$(dirname "$lib")"
@@ -494,7 +518,7 @@ extract_busybox_from_porteus_initrd() {
         info "  BusyBox statik — tidak perlu shared libraries"
     fi
 
-    log "  BusyBox dari Porteus berhasil diinstall"
+    log "  BusyBox dari porteux berhasil diinstall"
     log "  Test: $("$INITRD_DIR/bin/busybox" echo "busybox OK" 2>/dev/null || echo "tidak bisa ditest di host")"
 }
 
@@ -530,7 +554,7 @@ write_init() {
 
     cat > "$INITRD_DIR/init" << 'INIT_EOF'
 #!/bin/sh
-# /init — GoboLinux 017 Live, Porteus-style
+# /init — GoboLinux 017 Live, porteux-style
 # Fokus: Perbaikan TTY dan Deteksi CD-ROM QEMU
 
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/System/Links/Executables
@@ -586,7 +610,7 @@ done
 
 # ── 4. Cari Media (Metode Non-Awk) ───────────────────────────────────────────
 p "mencari media..."
-PORTEUS_DIR=""
+porteux_DIR=""
 mkdir -p /mnt/scan
 
 try_mount() {
@@ -595,12 +619,12 @@ try_mount() {
     p "  mencoba $dev ($fs)..."
     mount -t "$fs" -o ro "$dev" /mnt/scan 2>/dev/null || return 1
     
-    # Cek folder porteus
-    if [ -d "/mnt/scan/porteus/base" ]; then
-        PORTEUS_DIR="/mnt/scan/porteus"
+    # Cek folder porteux
+    if [ -d "/mnt/scan/porteux/base" ]; then
+        porteux_DIR="/mnt/scan/porteux"
         return 0
     elif [ -n "$FROM_PATH" ] && [ -d "/mnt/scan${FROM_PATH}/base" ]; then
-        PORTEUS_DIR="/mnt/scan${FROM_PATH}"
+        porteux_DIR="/mnt/scan${FROM_PATH}"
         return 0
     fi
     
@@ -633,7 +657,7 @@ if ! scan_all; then
     die_shell
 fi
 
-p "Media ditemukan di: $PORTEUS_DIR"
+p "Media ditemukan di: $porteux_DIR"
 
 # ── 5. Setup OverlayFS ───────────────────────────────────────────────────────
 p "assembling modules..."
@@ -641,7 +665,7 @@ mkdir -p /mnt/xzm /mnt/up /mnt/wk /mnt/newroot
 LOWER=""
 IDX=0
 
-for xzm in "$PORTEUS_DIR/base/"*.xzm; do
+for xzm in "$porteux_DIR/base/"*.xzm; do
     [ -f "$xzm" ] || continue
     mp="/mnt/xzm/$IDX"
     mkdir -p "$mp"
@@ -690,11 +714,12 @@ pack_initrd() {
     info "init ada  : $([ -f "$INITRD_DIR/init" ] && echo YA || echo TIDAK)"
     info "busybox   : $([ -f "$INITRD_DIR/bin/busybox" ] && echo YA || echo TIDAK)"
 
-    # Porteus pakai xz --check=crc32 (bukan zstd)
-    # Format ini kompatibel dengan syslinux dan semua bootloader
+    # Porteus/Porteux pakai xz --check=crc32
+    # xz lebih aman: semua kernel Linux support CONFIG_RD_XZ=y
+    # zstd butuh CONFIG_RD_ZSTD=y yang tidak selalu aktif
     local COMP_EXT="xz"
     local COMP_CMD="xz -9 --check=crc32"
-    info "Kompresi: xz (Porteus-style)"
+    info "Kompresi: xz --check=crc32 (Porteux-style)"
 
     # Pack main cpio ke file sementara (JANGAN pakai $() untuk binary data)
     local MAIN_COMP="$WORK/main.cpio.$COMP_EXT"
@@ -702,11 +727,11 @@ pack_initrd() {
     ( cd "$INITRD_DIR" && find . | sort | cpio -o -H newc --quiet 2>/dev/null )         | $COMP_CMD > "$MAIN_COMP"
     info "  main cpio: $(du -sh "$MAIN_COMP" | cut -f1)"
 
-    # Format Porteus: cpio xz saja (tanpa early_cpio di depan)
-    # Porteus tidak pakai early_cpio/microcode — microcode diurus oleh kernel/firmware
+    # Format porteux: cpio zstd saja (tanpa early_cpio di depan)
+    # porteux tidak pakai early_cpio/microcode — microcode diurus oleh kernel/firmware
     # Jika ingin menyertakan microcode GoboLinux: aktifkan blok di bawah
     cp "$MAIN_COMP" "$OUTPUT_INITRD"
-    info "Format: Porteus-style (xz cpio, tanpa early_cpio)"
+    info "Format: porteux-style (zstd cpio, tanpa early_cpio)"
 
     # [OPSIONAL] Aktifkan jika ingin early_cpio microcode GoboLinux:
     # if [ -s "$WORK/early.cpio" ]; then
@@ -721,7 +746,10 @@ pack_initrd() {
     local VERIFY_DIR="$WORK/verify"
     rm -rf "$VERIFY_DIR" && mkdir -p "$VERIFY_DIR"
 
-    if [ "$COMP_EXT" = "zst" ]; then
+    # Verifikasi sesuai COMP_EXT yang dipilih
+    if [ "$COMP_EXT" = "xz" ]; then
+        xzcat "$MAIN_COMP" 2>/dev/null | cpio -id --quiet -D "$VERIFY_DIR" 2>/dev/null || true
+    elif [ "$COMP_EXT" = "zst" ] || [ "$COMP_EXT" = "zstd" ]; then
         zstdcat "$MAIN_COMP" 2>/dev/null | cpio -id --quiet -D "$VERIFY_DIR" 2>/dev/null || true
     else
         xzcat "$MAIN_COMP" 2>/dev/null | cpio -id --quiet -D "$VERIFY_DIR" 2>/dev/null || true
@@ -751,8 +779,8 @@ main() {
     log "=== build-initrd.sh (GoboLinux 017 initramfs base) ==="
     log "  Output: $OUTPUT_INITRD"
     [ -n "$GOBO017_INITRD"  ] && log "  initrd GoboLinux 017: $GOBO017_INITRD"
-    [ -n "$SLAX_ISO"        ] && warn "  --slax diabaikan (BusyBox dari Porteus initrd)"
-    [ -n "$PORTEUS_INITRD"  ] && log  "  Porteus initrd  : $PORTEUS_INITRD"
+    [ -n "$SLAX_ISO"        ] && warn "  --slax diabaikan (BusyBox dari porteux initrd)"
+    [ -n "$PORTEUX_INITRD"  ] && log  "  porteux initrd  : $PORTEUX_INITRD"
     [ -n "$GOBO016_ISO"     ] && warn "  --gobo016 diabaikan"
     [ -n "$GOBO017_ROOT"    ] && warn "  --gobo017root diabaikan (modules dari initramfs)"
     echo ""
@@ -769,14 +797,14 @@ main() {
     # Simpan early_cpio (microcode AMD/Intel)
     save_early_cpio "$extract_dir"
 
-    # Install BusyBox dari Porteus initrd (lebih lengkap dari GoboLinux)
-    # Porteus BusyBox: statik, semua applet tersedia (mount, mknod, switch_root, dll)
-    extract_busybox_from_porteus_initrd
+    # Install BusyBox dari porteux initrd (lebih lengkap dari GoboLinux)
+    # porteux BusyBox: statik, semua applet tersedia (mount, mknod, switch_root, dll)
+    extract_busybox_from_PORTEUX_INITRD
 
-    # Tulis /init script Porteus-style
+    # Tulis /init script porteux-style
     write_init
 
-    # Pack menjadi initrd.xz
+    # Pack menjadi initrd.zstd
     pack_initrd
 
     echo ""
