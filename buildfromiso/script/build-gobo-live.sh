@@ -243,26 +243,39 @@ extract_syslinux_from_porteux() {
     # - splash.png/jpg   : background menu (opsional)
     # - isohdpfx.bin     : untuk isohybrid (USB boot)
 
-    local copied=0 skipped=0
+    # KRITIS: semua .c32 HARUS dari versi syslinux yang sama
+    # Mencampur .c32 dari sumber berbeda menyebabkan:
+    #   "Undef symbol FAIL: init_fpu"
+    #   "Failed to load libcom32.c32"
+    # Solusi: SELALU timpa dengan file dari Porteus, hapus file lama dulu
+
+    # Hapus semua .c32 dan .bin lama yang mungkin dari sumber lain
+    log "  Bersihkan .c32 lama di $dst ..."
+    find "$dst" -maxdepth 1 \( -name "*.c32" -o -name "*.bin" \)         ! -name "vmlinuz" ! -name "initrd*"         -delete 2>/dev/null || true
+
+    local copied=0
+    local syslinux_src=""
     for isodir in         "$porteux_mnt/boot/syslinux"         "$porteux_mnt/boot/isolinux"         "$porteux_mnt/syslinux"         "$porteux_mnt/isolinux"
     do
         [ -d "$isodir" ] || continue
-        log "  Salin dari: ${isodir#$porteux_mnt}"
-        find "$isodir" -maxdepth 1 -type f | while read -r f; do
-            local bn="${f##*/}"
-            # Lewati file boot porteux sendiri (kernel, initrd, porteux.cfg)
-            case "$bn" in
-                vmlinuz|kernel|initrd*|initramfs*|porteux.cfg|syslinux.cfg) continue ;;
-            esac
-            # Salin ke dst, jangan timpa jika sudah ada dari GoboLinux ISO
-            if [ ! -f "$dst/$bn" ]; then
-                cp "$f" "$dst/$bn" 2>/dev/null && copied=$((copied+1)) || true
-                info "    + $bn"
-            else
-                skipped=$((skipped+1))
-            fi
-        done
-        break  # Ambil dari direktori pertama yang ditemukan
+        syslinux_src="$isodir"
+        log "  Sumber syslinux: ${isodir#$porteux_mnt}"
+        break
+    done
+
+    [ -n "$syslinux_src" ] || { warn "Direktori syslinux tidak ditemukan di Porteux ISO"; return 0; }
+
+    # Salin SEMUA file dari direktori syslinux Porteus (kecuali kernel/initrd/cfg)
+    find "$syslinux_src" -maxdepth 1 -type f | while read -r f; do
+        local bn="${f##*/}"
+        case "$bn" in
+            vmlinuz|kernel|initrd*|initramfs*|porteus.cfg|porteux.cfg|syslinux.cfg|isolinux.cfg)
+                continue ;;
+        esac
+        cp "$f" "$dst/$bn" 2>/dev/null && {
+            copied=$((copied+1))
+            info "    + $bn"
+        } || true
     done
 
     # Khusus: salin isohdpfx.bin untuk isohybrid (USB dd boot)
@@ -340,15 +353,22 @@ extract_syslinux_from_porteux() {
 
     # Verifikasi file kritis
     local critical_ok=1
-    for critical in "isolinux.bin" "ldlinux.c32" "vesamenu.c32"; do
+    for critical in "isolinux.bin" "ldlinux.c32" "libcom32.c32" "vesamenu.c32"; do
         if [ -f "$dst/$critical" ]; then
             info "  OK: $critical"
         else
-            warn "  MISSING: $critical — boot mungkin gagal"
+            warn "  MISSING: $critical"
             critical_ok=0
         fi
     done
-    [ "$critical_ok" = "1" ] && log "  Semua file syslinux kritis tersedia" ||         warn "  Beberapa file kritis tidak ada — coba ISO porteux yang berbeda"
+
+    # Tampilkan semua .c32 yang tersedia untuk diagnosis
+    log "  Daftar .c32 di output:"
+    find "$dst" -maxdepth 1 -name "*.c32" 2>/dev/null | sort | while read -r f; do
+        info "    $(basename "$f")"
+    done
+
+    [ "$critical_ok" = "1" ] &&         log "  Semua file syslinux kritis tersedia — versi konsisten dari Porteus" ||         warn "  File kritis MISSING — pastikan PORTEUS_ISO valid (Porteus 5.x x86_64)"
 }
 
 # ── Setup boot files ──────────────────────────────────────────────────────────
@@ -773,6 +793,8 @@ PROMPT 0
 TIMEOUT 90
 DEFAULT graphics
 
+# UI vesamenu.c32 dibutuhkan dari sumber yang SAMA dengan libcom32.c32
+# Semua .c32 harus dari Porteus ISO — jangan campur dari sumber berbeda
 UI vesamenu.c32
 MENU TITLE  GoboLinux 017.01 Live  [porteux-style]
 
