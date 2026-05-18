@@ -6,6 +6,7 @@ GOBO017_ISO ?= GoboLinux-017.01-x86_64.iso
 GOBO016_ISO  ?= GoboLinux-016.01-x86_64.iso
 SLAX_ISO     ?= $(firstword $(wildcard slax-*.iso))
 PORTEUS_ISO  ?= $(firstword $(wildcard Porteus*.iso porteus*.iso))
+PORTEUX_ISO  ?= $(or $(PORTEUS_ISO),$(firstword $(wildcard Porteux*.iso porteux*.iso)))
 COMP         ?= xz
 
 .PHONY: all help download download-016 download-porteus build kernel initrd usb iso clean
@@ -75,7 +76,6 @@ build:
 
 initrd:
 	@[ "$$(id -u)" = "0" ] || { echo "Perlu root: sudo make initrd"; exit 1; }
-	@# initramfs GoboLinux 017 dihasilkan oleh make build
 	@INITRD_ORIG="$(OUTPUT)/boot/syslinux/initrd-gobo-orig"; \
 	INITRD_OUT="$(OUTPUT)/boot/syslinux/initrd.xz"; \
 	if [ ! -f "$$INITRD_ORIG" ]; then \
@@ -83,17 +83,24 @@ initrd:
 	    echo "Jalankan dulu: sudo make build"; \
 	    exit 1; \
 	fi; \
-	echo "Menggunakan initramfs GoboLinux 017: $$INITRD_ORIG"; \
-	echo "Format: $$(file -b "$$INITRD_ORIG" | cut -c1-60)"; \
-	PORTEUS_INITRD_FILE="$(OUTPUT)/boot/syslinux/porteus-initrd.xz"; \
-	PORTEUS_ARG=""; \
-	[ -f "$$PORTEUS_INITRD_FILE" ] && PORTEUS_ARG="--porteus-initrd $$PORTEUS_INITRD_FILE"; \
-	[ -n "$(PORTEUS_ISO)" ] && [ -z "$$PORTEUS_ARG" ] && \
-	    PORTEUS_ARG="--porteus-initrd $(PORTEUS_ISO)"; \
-	echo "Porteus initrd: $${PORTEUS_ARG:-(tidak ada, BusyBox dari GoboLinux initramfs)}"; \
+	echo "GoboLinux 017 initrd : $$INITRD_ORIG"; \
+	echo "Format               : $$(file -b "$$INITRD_ORIG" | cut -c1-60)"; \
+	PORTEUX_ARG=""; \
+	PORTEUX_INITRD_FILE="$(OUTPUT)/boot/syslinux/porteux-initrd.xz"; \
+	if [ -f "$$PORTEUX_INITRD_FILE" ]; then \
+	    PORTEUX_ARG="--porteux-initrd $$PORTEUX_INITRD_FILE"; \
+	    echo "Porteux initrd (auto): $$PORTEUX_INITRD_FILE"; \
+	elif [ -n "$(PORTEUX_ISO)" ] && [ -f "$(PORTEUX_ISO)" ]; then \
+	    PORTEUX_ARG="--porteux-initrd $(PORTEUX_ISO)"; \
+	    echo "Porteux ISO          : $(PORTEUX_ISO)"; \
+	else \
+	    echo "WARN: porteux-initrd.xz tidak ada di output."; \
+	    echo "  Jalankan dulu: sudo make build PORTEUX_ISO=/path/porteux.iso"; \
+	    echo "  Atau: PORTEUX_ISO=/path/porteux.iso make initrd"; \
+	fi; \
 	bash $(SCRIPTS)/build-initrd.sh \
 	    --gobo017initrd "$$INITRD_ORIG" \
-	    $$PORTEUS_ARG \
+	    $$PORTEUX_ARG \
 	    --output "$$INITRD_OUT"
 
 
