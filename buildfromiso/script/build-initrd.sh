@@ -405,121 +405,156 @@ save_early_cpio() {
 extract_busybox_from_PORTEUX_INITRD() {
     log "=== Ekstrak BusyBox dari porteux initrd ==="
 
-    # Resolve path initrd porteux
-    local PORTEUX_INITRD="$PORTEUX_INITRD"
+    # Gunakan variabel global PORTEUX_INITRD (jangan re-declare sebagai local)
+    local porteux_input="$PORTEUX_INITRD"
+    local porteux_extract="$WORK/porteux-initrd-extract"
+    local porteux_iso_mnt="$WORK/porteux-iso-mnt"
+    local actual_initrd=""
 
-    # Auto-detect: cari initrd.xz porteux di lokasi standar output build
-    if [ -z "$PORTEUX_INITRD" ]; then
+    # Auto-detect: cari porteux-initrd.xz di output build
+    if [ -z "$porteux_input" ]; then
         local output_syslinux
         output_syslinux="$(dirname "$OUTPUT_INITRD")"
-        for candidate in             "$output_syslinux/porteux-initrd.xz"             "$output_syslinux/../../../boot/syslinux/initrd.xz.porteux"
+        for candidate in \
+            "$output_syslinux/porteux-initrd.xz" \
+            "$output_syslinux/porteus-initrd.xz"
         do
-            [ -f "$candidate" ] && { PORTEUX_INITRD="$candidate"; break; }
+            [ -f "$candidate" ] && { porteux_input="$candidate"; break; }
         done
     fi
 
-    if [ -z "$PORTEUX_INITRD" ] || [ ! -f "$PORTEUX_INITRD" ]; then
-        warn "porteux initrd tidak ditemukan — BusyBox tidak diinstall"
-        warn "Gunakan: --porteux-initrd /path/to/porteux/initrd.xz"
-        warn "Atau set: PORTEUX_INITRD=/path make initrd"
+    if [ -z "$porteux_input" ] || [ ! -f "$porteux_input" ]; then
+        warn "porteux initrd/ISO tidak ditemukan — BusyBox tidak diinstall"
+        warn "Gunakan: --porteux-initrd /path/to/porteux.iso"
+        warn "Atau jalankan dulu: sudo make build PORTEUX_ISO=/path/to/porteux.iso"
         return 0
     fi
-
-    log "  porteux initrd: $PORTEUX_INITRD"
-    log "  Format: $(file -b "$PORTEUX_INITRD" | cut -c1-60)"
-    log "  Ukuran: $(du -sh "$PORTEUX_INITRD" | cut -f1)"
-
-    # Ekstrak ke direktori sementara
-    local porteux_extract="$WORK/porteux-initrd-extract"
-    mkdir -p "$porteux_extract"
 
     local fmt
-    fmt=$(file -b "$PORTEUX_INITRD")
+    fmt=$(file -b "$porteux_input" 2>/dev/null)
+    log "  Input : $porteux_input"
+    log "  Format: $(echo "$fmt" | cut -c1-60)"
+    log "  Ukuran: $(du -sh "$porteux_input" | cut -f1)"
 
-    log "  Mengekstrak porteux initrd..."
-    if echo "$fmt" | grep -qi "XZ"; then
-        xzcat "$PORTEUX_INITRD" | cpio -id --quiet -D "$porteux_extract" 2>/dev/null || true
-    elif echo "$fmt" | grep -qi "gzip"; then
-        zcat "$PORTEUX_INITRD" | cpio -id --quiet -D "$porteux_extract" 2>/dev/null || true
-    elif echo "$fmt" | grep -qi "Zstandard"; then
-        zstdcat "$PORTEUX_INITRD" | cpio -id --quiet -D "$porteux_extract" 2>/dev/null || true
-    else
-        # Coba semua format
-        xzcat   "$PORTEUX_INITRD" 2>/dev/null | cpio -id --quiet -D "$porteux_extract" 2>/dev/null ||         zcat    "$PORTEUX_INITRD" 2>/dev/null | cpio -id --quiet -D "$porteux_extract" 2>/dev/null ||         zstdcat "$PORTEUX_INITRD" 2>/dev/null | cpio -id --quiet -D "$porteux_extract" 2>/dev/null ||         { warn "Gagal mengekstrak porteux initrd"; return 0; }
-    fi
+    mkdir -p "$porteux_extract"
 
-    log "  Isi porteux initrd (top level):"
-    ls "$porteux_extract/" 2>/dev/null | while read -r d; do info "    $d"; done
+    # ── Jika input adalah ISO Porteus: mount dan ambil initrd dari dalamnya ──
+    if echo "$fmt" | grep -qi "ISO 9660\|UDF\|CD-ROM"; then
+        log "  Input adalah ISO — mount dan ambil initrd..."
+        mkdir -p "$porteux_iso_mnt"
+        if mount -o loop,ro "$porteux_input" "$porteux_iso_mnt" 2>/dev/null; then
 
-    # Cari binary busybox
-    local bb_src=""
-    for candidate in         "$porteux_extract/bin/busybox"         "$porteux_extract/usr/bin/busybox"         "$porteux_extract/busybox"
-    do
-        [ -f "$candidate" ] || continue
-        local ftype; ftype=$(file -b "$candidate")
-        if echo "$ftype" | grep -qi "ELF"; then
-            bb_src="$candidate"
-            info "  BusyBox ditemukan: ${candidate#$porteux_extract/}"
-            info "    $(file -b "$candidate" | cut -c1-60)"
-            info "    Ukuran: $(du -sh "$candidate" | cut -f1)"
-            break
+            log "  Isi boot/ dalam ISO:"
+            find "$porteux_iso_mnt/boot" -maxdepth 2 2>/dev/null | sort | \
+                while read -r f; do info "    ${f#$porteux_iso_mnt}"; done
+
+            for candidate in \
+                "$porteux_iso_mnt/boot/syslinux/initrd.xz" \
+                "$porteux_iso_mnt/boot/syslinux/initrd.img" \
+                "$porteux_iso_mnt/boot/isolinux/initrd.xz" \
+                "$porteux_iso_mnt/porteux/boot/initrd.xz" \
+                "$porteux_iso_mnt/porteus/boot/initrd.xz"
+            do
+                [ -f "$candidate" ] || continue
+                # Salin ke /tmp agar tetap bisa diakses setelah umount
+                local tmp_initrd="$WORK/porteux-initrd-tmp.xz"
+                cp "$candidate" "$tmp_initrd"
+                actual_initrd="$tmp_initrd"
+                log "  Initrd ditemukan: ${candidate#$porteux_iso_mnt} ($(du -sh "$tmp_initrd" | cut -f1))"
+                break
+            done
+
+            umount "$porteux_iso_mnt" 2>/dev/null || true
+        else
+            warn "  Gagal mount ISO: $porteux_input"
         fi
-    done
 
-    if [ -z "$bb_src" ]; then
-        warn "  BusyBox tidak ditemukan dalam porteux initrd"
-        # Tampilkan isi bin/ untuk diagnosis
-        log "  Isi bin/ porteux initrd:"
-        ls "$porteux_extract/bin/" 2>/dev/null | while read -r f; do info "    $f"; done
-        return 0
-    fi
-
-    # Install BusyBox ke INITRD_DIR
-    log "  Install BusyBox ke initramfs..."
-    mkdir -p "$INITRD_DIR/bin" "$INITRD_DIR/sbin"
-    cp "$bb_src" "$INITRD_DIR/bin/busybox"
-    chmod 755 "$INITRD_DIR/bin/busybox"
-
-    # Buat symlink applet dari busybox --list
-    # Gunakan daftar hardcode yang paling penting (portable, tidak butuh busybox --list)
-    local APPLETS_BIN="sh ash bash cat echo printf ls mkdir rm mv cp ln
-        mount umount losetup mknod modprobe insmod lsmod
-        sleep kill ps grep sed awk cut head find xargs sort
-        blkid lsblk fdisk df du free dmesg uname date
-        gunzip xzcat zcat zstdcat cpio tar gzip
-        ifconfig ip route ping
-        chroot switch_root pivot_root
-        true false test expr read"
-
-    local APPLETS_SBIN="switch_root pivot_root modprobe insmod blkid
-        losetup udevd udevadm mdev"
-
-    local count_bin=0 count_sbin=0
-    for app in $APPLETS_BIN; do
-        ln -sf busybox "$INITRD_DIR/bin/$app" 2>/dev/null && count_bin=$((count_bin+1)) || true
-    done
-    for app in $APPLETS_SBIN; do
-        ln -sf ../bin/busybox "$INITRD_DIR/sbin/$app" 2>/dev/null && count_sbin=$((count_sbin+1)) || true
-    done
-
-    info "  Symlink: $count_bin di /bin/, $count_sbin di /sbin/"
-
-    # Salin juga lib yang dibutuhkan BusyBox jika dynamic
-    if echo "$(file -b "$bb_src")" | grep -qi "dynamically linked"; then
-        warn "  BusyBox porteux adalah dynamic linked — menyalin shared libraries..."
-        ldd "$bb_src" 2>/dev/null | grep -o '/[^ ]*' | while read -r lib; do
-            [ -f "$lib" ] || continue
-            local libdir; libdir="$(dirname "$lib")"
-            mkdir -p "$INITRD_DIR$libdir"
-            cp "$lib" "$INITRD_DIR$libdir/" 2>/dev/null || true
-            info "    lib: $lib"
-        done
+        if [ -z "$actual_initrd" ]; then
+            warn "  initrd tidak ditemukan di dalam ISO Porteus"
+            return 0
+        fi
     else
-        info "  BusyBox statik — tidak perlu shared libraries"
+        # Input sudah berupa file initrd langsung
+        actual_initrd="$porteux_input"
     fi
 
-    log "  BusyBox dari porteux berhasil diinstall"
-    log "  Test: $("$INITRD_DIR/bin/busybox" echo "busybox OK" 2>/dev/null || echo "tidak bisa ditest di host")"
+    # ── Ekstrak initrd ───────────────────────────────────────────────────────
+    local initrd_fmt
+    initrd_fmt=$(file -b "$actual_initrd" 2>/dev/null)
+    log "  Ekstrak initrd: $(echo "$initrd_fmt" | cut -c1-50)"
+
+    local extracted=0
+    if (cd "$porteux_extract" && xzcat "$actual_initrd" 2>/dev/null | cpio -id --quiet 2>/dev/null); then
+        extracted=1; log "  Ekstrak: xz OK"
+    elif (cd "$porteux_extract" && zstdcat "$actual_initrd" 2>/dev/null | cpio -id --quiet 2>/dev/null); then
+        extracted=1; log "  Ekstrak: zstd OK"
+    elif (cd "$porteux_extract" && zcat "$actual_initrd" 2>/dev/null | cpio -id --quiet 2>/dev/null); then
+        extracted=1; log "  Ekstrak: gzip OK"
+    fi
+
+    # Fallback unmkinitramfs untuk format early_cpio+main
+    if [ "$extracted" -eq 0 ] && command -v unmkinitramfs &>/dev/null; then
+        unmkinitramfs "$actual_initrd" "$porteux_extract" 2>/dev/null && \
+            { extracted=1; log "  Ekstrak: unmkinitramfs OK"; }
+    fi
+
+    # Jika ada subdir main/ (format GoboLinux/dracut), busybox ada di sana
+    local search_root="$porteux_extract"
+    for subdir in "$porteux_extract/main" "$porteux_extract/rootfs"; do
+        [ -d "$subdir" ] && { search_root="$subdir"; log "  Search root: $subdir"; break; }
+    done
+
+    # Tampilkan struktur untuk debug
+    log "  Struktur initrd (3 level):"
+    find "$search_root" -maxdepth 3 2>/dev/null | sort | head -30 | \
+        while read -r f; do info "    ${f#$search_root/}"; done
+
+    # ── Cari busybox ─────────────────────────────────────────────────────────
+    local bb_found=""
+
+    # Level 1: path standar
+    for candidate in \
+        "$search_root/bin/busybox" \
+        "$search_root/usr/bin/busybox" \
+        "$search_root/sbin/busybox" \
+        "$search_root/busybox"
+    do
+        [ -f "$candidate" ] && { bb_found="$candidate"; break; }
+    done
+
+    # Level 2: scan nama
+    [ -z "$bb_found" ] && \
+        bb_found=$(find "$search_root" -name "busybox" -type f 2>/dev/null | head -1)
+
+    # Level 3: ELF statik terbesar
+    if [ -z "$bb_found" ]; then
+        log "  Scan ELF statik (fallback)..."
+        while IFS= read -r -d "" f; do
+            file -b "$f" 2>/dev/null | grep -qi "statically linked" || continue
+            local fsz; fsz=$(stat -c%s "$f" 2>/dev/null || echo 0)
+            [ "$fsz" -gt 524288 ] && { bb_found="$f"; break; }
+        done < <(find "$search_root" -type f -print0 2>/dev/null)
+        [ -n "$bb_found" ] && log "  ELF statik: ${bb_found#$search_root/}"
+    fi
+
+    if [ -n "$bb_found" ]; then
+        cp "$bb_found" "$WORK/busybox-from-porteux"
+        chmod +x "$WORK/busybox-from-porteux"
+        log "  BusyBox: ${bb_found#$search_root/}"
+        log "  Format : $(file -b "$WORK/busybox-from-porteux" | cut -c1-60)"
+        log "  Ukuran : $(du -sh "$WORK/busybox-from-porteux" | cut -f1)"
+        echo "$WORK/busybox-from-porteux" > "$(dirname "$OUTPUT_INITRD")/.busybox-path"
+        log "  Path disimpan: $(dirname "$OUTPUT_INITRD")/.busybox-path"
+    else
+        warn "  BusyBox tidak ditemukan"
+        warn "  File ELF di dalam initrd:"
+        find "$search_root" -type f 2>/dev/null | while read -r f; do
+            file -b "$f" 2>/dev/null | grep -qi "ELF" && \
+                info "    ${f#$search_root/}"
+        done || true
+    fi
+
+    rm -rf "$porteux_extract" "$porteux_iso_mnt" 2>/dev/null || true
 }
 
 
