@@ -696,7 +696,9 @@ p "Media ditemukan di: $porteux_DIR"
 
 # ── 5. Setup OverlayFS ───────────────────────────────────────────────────────
 p "assembling modules..."
-mkdir -p /mnt/xzm /mnt/up /mnt/wk /mnt/newroot
+
+# Mount semua .xzm sebagai squashfs (read-only layers)
+mkdir -p /mnt/xzm /mnt/newroot
 LOWER=""
 IDX=0
 
@@ -705,25 +707,150 @@ for xzm in "$porteux_DIR/base/"*.xzm; do
     mp="/mnt/xzm/$IDX"
     mkdir -p "$mp"
     if mount -t squashfs -o loop,ro "$xzm" "$mp" 2>/dev/null; then
+        p "  +${xzm##*/}"
         LOWER="${LOWER:+$LOWER:}$mp"
         IDX=$((IDX+1))
+    else
+        p "  GAGAL mount: ${xzm##*/}"
     fi
 done
 
-mount -t tmpfs tmpfs /mnt/up
-mount -t overlay overlay -o "lowerdir=$LOWER,upperdir=/mnt/up,workdir=/mnt/wk" /mnt/newroot || die_shell
+for xzm in "$porteux_DIR/modules/"*.xzm; do
+    [ -f "$xzm" ] || continue
+    mp="/mnt/xzm/$IDX"
+    mkdir -p "$mp"
+    mount -t squashfs -o loop,ro "$xzm" "$mp" 2>/dev/null && {
+        LOWER="${LOWER:+$LOWER:}$mp"
+        IDX=$((IDX+1))
+    }
+done
 
-# ── 6. Transisi ke GoboLinux ─────────────────────────────────────────────────
+[ -n "$LOWER" ] || { p "GAGAL: tidak ada .xzm ter-mount"; die_shell; }
+p "  $IDX modul dimuat"
+
+# OverlayFS: upperdir dan workdir WAJIB di filesystem yang sama
+# Solusi: buat satu tmpfs di /mnt/cow, lalu buat subdir di dalamnya
+mkdir -p /mnt/cow
+mount -t tmpfs -o mode=0755 tmpfs /mnt/cow
+mkdir -p /mnt/cow/upper /mnt/cow/work
+
+p "mount overlay..."
+mount -t overlay overlay     -o "lowerdir=$LOWER,upperdir=/mnt/cow/upper,workdir=/mnt/cow/work"     /mnt/newroot || {
+    p "GAGAL overlay — dmesg:"
+    dmesg 2>/dev/null | tail -5
+    die_shell
+}
+p "overlay OK"
+
+# ── 6. Siapkan /dev /proc /sys di newroot ────────────────────────────────────
 p "pindah ke newroot..."
-mount --move /dev  /mnt/newroot/dev
-mount --move /proc /mnt/newroot/proc
-mount --move /sys  /mnt/newroot/sys
 
-# Pastikan init ada
-INIT="/sbin/init"
-[ -x "/mnt/newroot/System/Links/Executables/init" ] && INIT="/System/Links/Executables/init"
+# Bind mount /dev (lebih reliable dari mount --move untuk devtmpfs)
+mkdir -p /mnt/newroot/dev /mnt/newroot/proc /mnt/newroot/sys          /mnt/newroot/run /mnt/newroot/tmp
 
+mount --bind /dev  /mnt/newroot/dev  2>/dev/null ||     mount -t devtmpfs devtmpfs /mnt/newroot/dev 2>/dev/null || true
+mkdir -p /mnt/newroot/dev/pts
+mount --bind /dev/pts /mnt/newroot/dev/pts 2>/dev/null ||     mount -t devpts devpts /mnt/newroot/dev/pts 2>/dev/null || true
+mount --bind /proc /mnt/newroot/proc 2>/dev/null ||     mount -t proc proc /mnt/newroot/proc 2>/dev/null || true
+mount --bind /sys  /mnt/newroot/sys  2>/dev/null ||     mount -t sysfs sysfs /mnt/newroot/sys 2>/dev/null || true
+mount -t tmpfs tmpfs /mnt/newroot/run 2>/dev/null || true
+mount -t tmpfs tmpfs /mnt/newroot/tmp 2>/dev/null || true
+
+# Pastikan /dev/console ada di newroot sebelum switch_root
+[ -c /mnt/newroot/dev/console ] ||     mknod -m 600 /mnt/newroot/dev/console c 5 1 2>/dev/null || true
+
+# ── 7. Bangun GoboLinux System/Links ─────────────────────────────────────────
+# Tanpa ini /sbin/init tidak ada karena GoboLinux simpan binary di Programs/
+p "bangun System/Links..."
+mkdir -p /mnt/newroot/System/Links/Executables          /mnt/newroot/System/Links/Libraries          /mnt/newroot/System/Links/Headers          /mnt/newroot/System/Links/Settings
+
+if [ -d /mnt/newroot/Programs ]; then
+    for prog_dir in /mnt/newroot/Programs/*/; do
+        [ -d "$prog_dir" ] || continue
+
+        # Resolve Current symlink
+        if [ -L "${prog_dir}Current" ]; then
+            ver=$(readlink -f "${prog_dir}Current" 2>/dev/null)
+        else
+            ver=""
+            for vd in "${prog_dir}"*/; do
+                [ -d "$vd" ] && ver="$vd"
+            done
+            ver="${ver%/}"
+        fi
+        [ -d "$ver" ] || continue
+
+        # Buat Current jika belum ada
+        [ -e "${prog_dir}Current" ] ||             ln -snf "$ver" "${prog_dir}Current" 2>/dev/null
+
+        # Executables: bin/ sbin/
+        for sub in bin sbin; do
+            [ -d "$ver/$sub" ] || continue
+            for f in "$ver/$sub/"*; do
+                [ -e "$f" ] || continue
+                fn="${f##*/}"
+                dst="/mnt/newroot/System/Links/Executables/$fn"
+                [ -e "$dst" ] || ln -s "$f" "$dst" 2>/dev/null
+            done
+        done
+
+        # Libraries: lib/ lib64/
+        for sub in lib lib64; do
+            [ -d "$ver/$sub" ] || continue
+            for f in "$ver/$sub/"*; do
+                [ -e "$f" ] || continue
+                fn="${f##*/}"
+                dst="/mnt/newroot/System/Links/Libraries/$fn"
+                [ -e "$dst" ] || ln -s "$f" "$dst" 2>/dev/null
+            done
+        done
+    done
+    p "  System/Links selesai"
+fi
+
+# FHS compatibility symlinks di newroot
+# GoboLinux: /bin -> /System/Links/Executables, dll
+for pair in     "bin:/System/Links/Executables"     "sbin:/System/Links/Executables"     "lib:/System/Links/Libraries"     "lib64:/System/Links/Libraries"; do
+    lnk="${pair%%:*}"; tgt="${pair#*:}"
+    [ -e "/mnt/newroot/$lnk" ] ||         ln -s "$tgt" "/mnt/newroot/$lnk" 2>/dev/null || true
+done
+[ -e /mnt/newroot/usr ] || ln -s "/" /mnt/newroot/usr 2>/dev/null || true
+
+# ── 8. Jalankan InitializeCurrent jika ada ───────────────────────────────────
+INIT_CURRENT="/mnt/newroot/System/Settings/BootScripts/InitializeCurrent"
+if [ -x "$INIT_CURRENT" ]; then
+    p "  Menjalankan InitializeCurrent..."
+    chroot /mnt/newroot /System/Settings/BootScripts/InitializeCurrent 2>/dev/null || true
+fi
+
+# ── 9. Cari init GoboLinux ───────────────────────────────────────────────────
+p "isi newroot:"
+for d in /mnt/newroot/*/; do p "  ${d#/mnt/newroot/}"; done
+
+INIT=""
+for candidate in     /mnt/newroot/sbin/init     /mnt/newroot/System/Links/Executables/init     /mnt/newroot/bin/init     /mnt/newroot/Programs/Sysvinit/Current/sbin/init     /mnt/newroot/Programs/Systemd/Current/lib/systemd/systemd     /mnt/newroot/Programs/Systemd/Current/bin/systemd; do
+    if [ -x "$candidate" ]; then
+        INIT="${candidate#/mnt/newroot}"
+        p "init ditemukan: $INIT"
+        break
+    fi
+done
+
+if [ -z "$INIT" ]; then
+    p "init tidak ditemukan di path standar"
+    p "Cari di Programs/:"
+    for d in /mnt/newroot/Programs/*/; do
+        [ -d "$d" ] && p "  ${d##/mnt/newroot/}"
+    done
+    # Fallback ke sh — akan gagal tapi setidaknya tidak kernel panic
+    INIT="/bin/sh"
+    p "fallback: $INIT"
+fi
+
+p "exec switch_root -> $INIT"
 exec switch_root /mnt/newroot "$INIT"
+p "switch_root GAGAL"
+die_shell
 
 INIT_EOF
 
