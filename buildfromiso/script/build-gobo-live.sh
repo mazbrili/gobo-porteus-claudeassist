@@ -247,7 +247,7 @@ extract_syslinux_from_porteux() {
     # Mencampur .c32 dari sumber berbeda menyebabkan:
     #   "Undef symbol FAIL: init_fpu"
     #   "Failed to load libcom32.c32"
-    # Solusi: SELALU timpa dengan file dari Porteus, hapus file lama dulu
+    # Solusi: SELALU timpa dengan file dari Porteux, hapus file lama dulu
 
     # Hapus semua .c32 dan .bin lama yang mungkin dari sumber lain
     log "  Bersihkan .c32 lama di $dst ..."
@@ -265,11 +265,11 @@ extract_syslinux_from_porteux() {
 
     [ -n "$syslinux_src" ] || { warn "Direktori syslinux tidak ditemukan di Porteux ISO"; return 0; }
 
-    # Salin SEMUA file dari direktori syslinux Porteus (kecuali kernel/initrd/cfg)
+    # Salin SEMUA file dari direktori syslinux Porteux (kecuali kernel/initrd/cfg)
     find "$syslinux_src" -maxdepth 1 -type f | while read -r f; do
         local bn="${f##*/}"
         case "$bn" in
-            vmlinuz|kernel|initrd*|initramfs*|porteus.cfg|porteux.cfg|syslinux.cfg|isolinux.cfg)
+            vmlinuz|kernel|initrd*|initramfs*|porteux.cfg|syslinux.cfg|isolinux.cfg)
                 continue ;;
         esac
         cp "$f" "$dst/$bn" 2>/dev/null && {
