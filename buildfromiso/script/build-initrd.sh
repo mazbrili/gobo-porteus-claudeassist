@@ -239,7 +239,7 @@ extract_gobo017_initrd() {
         if [ -f "$bb" ]; then
             info "BusyBox: $(file -b "$bb" | cut -c1-50)"
         else
-            warn "BusyBox tidak ditemukan di $main_dir/bin/busybox"
+            info "BusyBox tidak ada di $main_dir/bin/busybox (akan diambil dari Porteux)"
         fi
     else
         warn "Programs/Linux tidak ditemukan — struktur initramfs mungkin berbeda"
@@ -557,6 +557,78 @@ extract_busybox_from_PORTEUX_INITRD() {
     rm -rf "$porteux_extract" "$porteux_iso_mnt" 2>/dev/null || true
 }
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAHAP 4b: Install BusyBox ke INITRD_DIR
+# Salin busybox dari WORK ke bin/busybox dan buat symlink semua applet
+# ─────────────────────────────────────────────────────────────────────────────
+install_busybox_to_initrd() {
+    log "=== Install BusyBox ke initrd ==="
+
+    local bb_src="$WORK/busybox-from-porteux"
+
+    # Cek apakah BusyBox sudah berhasil diekstrak dari Porteux
+    if [ ! -f "$bb_src" ]; then
+        # Coba baca dari .busybox-path
+        local path_file
+        path_file="$(dirname "$OUTPUT_INITRD")/.busybox-path"
+        if [ -f "$path_file" ]; then
+            bb_src=$(cat "$path_file")
+            info "Baca dari .busybox-path: $bb_src"
+        fi
+    fi
+
+    if [ -z "$bb_src" ] || [ ! -f "$bb_src" ]; then
+        # Coba cari BusyBox di dalam GoboLinux initramfs yang sudah disalin
+        # GoboLinux simpan di Programs/BusyBox/<ver>/bin/busybox
+        info "Cari BusyBox di INITRD_DIR/Programs/BusyBox/..."
+        local gobo_bb
+        gobo_bb=$(find "$INITRD_DIR/Programs" -name "busybox" -type f 2>/dev/null | head -1)
+        if [ -n "$gobo_bb" ]; then
+            info "  Ditemukan: ${gobo_bb#$INITRD_DIR/}"
+            bb_src="$gobo_bb"
+        else
+            warn "BusyBox tidak tersedia — initrd mungkin tidak bootable!"
+            warn "Pastikan PORTEUX_ISO disetel: make initrd PORTEUX_ISO=/path/to/porteux.iso"
+            return 0
+        fi
+    fi
+
+    info "BusyBox: $bb_src"
+    info "  Format: $(file -b "$bb_src" | cut -c1-60)"
+    info "  Ukuran: $(du -sh "$bb_src" | cut -f1)"
+
+    # Install ke INITRD_DIR/bin/busybox
+    mkdir -p "$INITRD_DIR/bin" "$INITRD_DIR/sbin"
+    cp "$bb_src" "$INITRD_DIR/bin/busybox"
+    chmod 755 "$INITRD_DIR/bin/busybox"
+    info "  Diinstall: $INITRD_DIR/bin/busybox"
+
+    # Buat symlink semua applet yang dibutuhkan /init
+    local applets=(
+        sh ash cat echo ls mkdir rm mv cp ln
+        mount umount losetup mknod switch_root
+        sleep true false test
+        dmesg uname modprobe
+        find xargs sort
+        chroot
+    )
+    local linked=0
+    for app in "${applets[@]}"; do
+        local dst="$INITRD_DIR/bin/$app"
+        [ -e "$dst" ] || { ln -sf busybox "$dst" 2>/dev/null && linked=$((linked+1)); }
+    done
+    # Juga di sbin
+    for app in switch_root mknod mount umount modprobe; do
+        [ -e "$INITRD_DIR/sbin/$app" ] ||             ln -sf ../bin/busybox "$INITRD_DIR/sbin/$app" 2>/dev/null || true
+    done
+    info "  $linked symlinks applet dibuat"
+
+    # Buat /bin/sh yang selalu ada (penting untuk /init dan shell darurat)
+    [ -e "$INITRD_DIR/bin/sh" ] || ln -sf busybox "$INITRD_DIR/bin/sh"
+
+    log "BusyBox terpasang di INITRD_DIR/bin/busybox"
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TAHAP 5: Tulis /init baru (ganti init GoboLinux 017 dengan init kita)
@@ -959,9 +1031,11 @@ main() {
     # Simpan early_cpio (microcode AMD/Intel)
     save_early_cpio "$extract_dir"
 
-    # Install BusyBox dari porteux initrd (lebih lengkap dari GoboLinux)
-    # porteux BusyBox: statik, semua applet tersedia (mount, mknod, switch_root, dll)
+    # Ekstrak BusyBox dari porteux initrd ke WORK
     extract_busybox_from_PORTEUX_INITRD
+
+    # Install BusyBox dari WORK ke INITRD_DIR/bin/busybox + semua symlink applet
+    install_busybox_to_initrd
 
     # Tulis /init script porteux-style
     write_init
