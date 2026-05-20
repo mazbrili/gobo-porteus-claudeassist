@@ -438,7 +438,7 @@ extract_busybox_from_PORTEUX_INITRD() {
 
     mkdir -p "$porteux_extract"
 
-    # ── Jika input adalah ISO Porteus: mount dan ambil initrd dari dalamnya ──
+    # ── Jika input adalah ISO Porteux: mount dan ambil initrd dari dalamnya ──
     if echo "$fmt" | grep -qi "ISO 9660\|UDF\|CD-ROM"; then
         log "  Input adalah ISO — mount dan ambil initrd..."
         mkdir -p "$porteux_iso_mnt"
@@ -450,6 +450,7 @@ extract_busybox_from_PORTEUX_INITRD() {
 
             for candidate in \
                 "$porteux_iso_mnt/boot/syslinux/initrd.xz" \
+                "$porteux_iso_mnt/boot/syslinux/initrd.zst" \
                 "$porteux_iso_mnt/boot/syslinux/initrd.img" \
                 "$porteux_iso_mnt/boot/isolinux/initrd.xz" \
                 "$porteux_iso_mnt/porteux/boot/initrd.xz" \
@@ -654,9 +655,9 @@ write_init() {
 
     # Deteksi PATH yang benar dari initramfs GoboLinux
     local gobo_path="/bin:/sbin:/usr/bin:/usr/sbin"
-    if [ -d "$INITRD_DIR/System/Links/Executables" ]; then
-        gobo_path="/System/Links/Executables:/System/Links/Libraries:$gobo_path"
-        info "Menggunakan System/Links PATH"
+    if [ -d "$INITRD_DIR/System/Index/bin" ]; then
+        gobo_path="/System/Index/bin:/System/Index/lib:$gobo_path"
+        info "Menggunakan System/Index PATH"
     fi
 
     cat > "$INITRD_DIR/init" << 'INIT_EOF'
@@ -664,7 +665,7 @@ write_init() {
 # /init — GoboLinux 017 Live, porteux-style
 # Fokus: Perbaikan TTY dan Deteksi CD-ROM QEMU
 
-export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/System/Links/Executables
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/System/Index/bin
 
 p() { echo "[init] $*"; }
 
@@ -831,10 +832,10 @@ mount -t tmpfs tmpfs /mnt/newroot/tmp 2>/dev/null || true
 # Pastikan /dev/console ada di newroot sebelum switch_root
 [ -c /mnt/newroot/dev/console ] ||     mknod -m 600 /mnt/newroot/dev/console c 5 1 2>/dev/null || true
 
-# ── 7. Bangun GoboLinux System/Links ─────────────────────────────────────────
+# ── 7. Bangun GoboLinux System/Index ─────────────────────────────────────────
 # Tanpa ini /sbin/init tidak ada karena GoboLinux simpan binary di Programs/
-p "bangun System/Links..."
-mkdir -p /mnt/newroot/System/Links/Executables          /mnt/newroot/System/Links/Libraries          /mnt/newroot/System/Links/Headers          /mnt/newroot/System/Links/Settings
+p "bangun System/Index..."
+mkdir -p /mnt/newroot/System/Index/bin          /mnt/newroot/System/Index/lib          /mnt/newroot/System/Index/include          /mnt/newroot/System/Settings
 
 if [ -d /mnt/newroot/Programs ]; then
     for prog_dir in /mnt/newroot/Programs/*/; do
@@ -861,7 +862,7 @@ if [ -d /mnt/newroot/Programs ]; then
             for f in "$ver/$sub/"*; do
                 [ -e "$f" ] || continue
                 fn="${f##*/}"
-                dst="/mnt/newroot/System/Links/Executables/$fn"
+                dst="/mnt/newroot/System/Index/bin/$fn"
                 [ -e "$dst" ] || ln -s "$f" "$dst" 2>/dev/null
             done
         done
@@ -872,17 +873,17 @@ if [ -d /mnt/newroot/Programs ]; then
             for f in "$ver/$sub/"*; do
                 [ -e "$f" ] || continue
                 fn="${f##*/}"
-                dst="/mnt/newroot/System/Links/Libraries/$fn"
+                dst="/mnt/newroot/System/Index/lib/$fn"
                 [ -e "$dst" ] || ln -s "$f" "$dst" 2>/dev/null
             done
         done
     done
-    p "  System/Links selesai"
+    p "  System/Index selesai"
 fi
 
 # FHS compatibility symlinks di newroot
-# GoboLinux: /bin -> /System/Links/Executables, dll
-for pair in     "bin:/System/Links/Executables"     "sbin:/System/Links/Executables"     "lib:/System/Links/Libraries"     "lib64:/System/Links/Libraries"; do
+# GoboLinux: /bin -> /System/Index/bin, dll
+for pair in     "bin:/System/Index/bin"     "sbin:/System/Index/bin"     "lib:/System/Index/lib"     "lib64:/System/Index/lib"; do
     lnk="${pair%%:*}"; tgt="${pair#*:}"
     [ -e "/mnt/newroot/$lnk" ] ||         ln -s "$tgt" "/mnt/newroot/$lnk" 2>/dev/null || true
 done
@@ -900,7 +901,7 @@ p "isi newroot:"
 for d in /mnt/newroot/*/; do p "  ${d#/mnt/newroot/}"; done
 
 INIT=""
-for candidate in     /mnt/newroot/sbin/init     /mnt/newroot/System/Links/Executables/init     /mnt/newroot/bin/init     /mnt/newroot/Programs/Sysvinit/Current/sbin/init     /mnt/newroot/Programs/Systemd/Current/lib/systemd/systemd     /mnt/newroot/Programs/Systemd/Current/bin/systemd; do
+for candidate in     /mnt/newroot/sbin/init     /mnt/newroot/System/Index/bin/init     /mnt/newroot/bin/init     /mnt/newroot/Programs/Sysvinit/Current/sbin/init     /mnt/newroot/Programs/Systemd/Current/lib/systemd/systemd     /mnt/newroot/Programs/Systemd/Current/bin/systemd; do
     if [ -x "$candidate" ]; then
         INIT="${candidate#/mnt/newroot}"
         p "init ditemukan: $INIT"
