@@ -663,119 +663,79 @@ write_init() {
     cat > "$INITRD_DIR/init" << 'INIT_EOF'
 #!/bin/sh
 # /init — GoboLinux 017 Live, porteux-style
-# Fokus: Perbaikan TTY dan Deteksi CD-ROM QEMU
-
-export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/System/Index/bin
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 
 p() { echo "[init] $*"; }
 
-# Perbaikan fungsi Shell Darurat agar TTY bisa diakses
 die_shell() {
     p "=== SHELL DARURAT ==="
-    p "Periksa apakah /dev/sr0 atau /dev/sd* ada di bawah ini:"
-    ls -l /dev/sr* /dev/sd* /dev/vd* 2>/dev/null
-    p "Isi /proc/partitions:"
-    cat /proc/partitions 2>/dev/null
-    
-    # Memaksa shell menggunakan console agar job control aktif
+    p "/proc/partitions:"; cat /proc/partitions 2>/dev/null
+    p "/dev:"; ls /dev/ 2>/dev/null
+    p "dmesg:"; dmesg 2>/dev/null | tail -20
     exec setsid sh -c 'exec sh </dev/console >/dev/console 2>&1'
 }
 
 # ── 1. Pseudo-filesystems ────────────────────────────────────────────────────
-mount -t proc     proc  /proc    2>/dev/null
-mount -t sysfs    sysfs /sys     2>/dev/null
-# Penting: devtmpfs sangat disarankan agar QEMU otomatis membuat /dev/sr0
-mount -t devtmpfs dev   /dev     2>/dev/null || mount -t tmpfs tmpfs /dev 2>/dev/null
-
+mount -t proc     proc  /proc  2>/dev/null
+mount -t sysfs    sysfs /sys   2>/dev/null
+mount -t devtmpfs dev   /dev   2>/dev/null || mount -t tmpfs tmpfs /dev 2>/dev/null
 mkdir -p /dev/pts /dev/shm /tmp /run
-mount -t devpts devpts /dev/pts 2>/dev/null
-mount -t tmpfs  tmpfs  /dev/shm 2>/dev/null
-
-# Pastikan node dasar ada untuk shell
+mount -t devpts devpts /dev/pts 2>/dev/null || true
 [ -c /dev/console ] || mknod -m 600 /dev/console c 5 1 2>/dev/null
 [ -c /dev/tty ]     || mknod -m 666 /dev/tty     c 5 0 2>/dev/null
-
+[ -c /dev/null ]    || mknod -m 666 /dev/null     c 1 3 2>/dev/null
 p "kernel: $(uname -r)"
 
-# ── 2. Load Kernel Modules (Penting untuk Q35 & SATA) ────────────────────────
+# ── 2. Load drivers ──────────────────────────────────────────────────────────
 p "loading hardware drivers..."
-# ahci & libahci: Untuk kontroler SATA di mesin Q35
-# sr_mod & cdrom: Untuk pembaca CD-ROM
-# sd_mod: Untuk akses disk (SATA diperlakukan seperti SCSI)
-# isofs: Untuk membaca format ISO9660
 for mod in libahci ahci cdrom sr_mod sd_mod isofs squashfs overlay loop; do
-    modprobe $mod 2>/dev/null
+    modprobe "$mod" 2>/dev/null || true
 done
 sleep 3
 
 # ── 3. Parse cmdline ─────────────────────────────────────────────────────────
 FROM_PATH=""
 for arg in $(cat /proc/cmdline 2>/dev/null); do
-    case "$arg" in
-        from=*) FROM_PATH="${arg#from=}" ;;
-    esac
+    case "$arg" in from=*) FROM_PATH="${arg#from=}" ;; esac
 done
 
-# ── 4. Cari Media (Metode Non-Awk) ───────────────────────────────────────────
+# ── 4. Cari media ────────────────────────────────────────────────────────────
 p "mencari media..."
 porteux_DIR=""
 mkdir -p /mnt/scan
 
 try_mount() {
-    dev="$1"; fs="$2"
-    [ -b "$dev" ] || return 1
-    p "  mencoba $dev ($fs)..."
-    mount -t "$fs" -o ro "$dev" /mnt/scan 2>/dev/null || return 1
-    
-    # Cek folder porteux
+    [ -b "$1" ] || return 1
+    p "  mencoba $1 ($2)..."
+    mount -t "$2" -o ro "$1" /mnt/scan 2>/dev/null || return 1
     if [ -d "/mnt/scan/porteux/base" ]; then
-        porteux_DIR="/mnt/scan/porteux"
-        return 0
-    elif [ -n "$FROM_PATH" ] && [ -d "/mnt/scan${FROM_PATH}/base" ]; then
-        porteux_DIR="/mnt/scan${FROM_PATH}"
-        return 0
+        porteux_DIR="/mnt/scan/porteux"; return 0
     fi
-    
-    umount /mnt/scan 2>/dev/null
-    return 1
+    umount /mnt/scan 2>/dev/null; return 1
 }
 
 scan_all() {
-    # 1. Cek spesifik sr* (CD-ROM QEMU)
     for sr in /dev/sr*; do
         [ -b "$sr" ] && try_mount "$sr" "iso9660" && return 0
     done
-
-    # 2. Cek semua di /proc/partitions (Disk/USB)
-    while read major minor blocks name; do
-        case "$name" in
-            ""|name|loop*|ram*|zram*) continue ;;
-        esac
-        
-        for fs in vfat ext4 ntfs iso9660; do
+    while read -r major minor blocks name; do
+        case "$name" in ""|name|loop*|ram*|zram*) continue ;; esac
+        for fs in vfat ext4 iso9660; do
             try_mount "/dev/$name" "$fs" && return 0
         done
     done < /proc/partitions
-    
     return 1
 }
 
-if ! scan_all; then
-    p "GAGAL: Media tidak ditemukan."
-    die_shell
-fi
+scan_all || { p "GAGAL: Media tidak ditemukan."; die_shell; }
+p "Media: $porteux_DIR"
 
-p "Media ditemukan di: $porteux_DIR"
-
-# ── 5. Setup OverlayFS ───────────────────────────────────────────────────────
+# ── 5. Mount .xzm → OverlayFS ────────────────────────────────────────────────
 p "assembling modules..."
-
-# Mount semua .xzm sebagai squashfs (read-only layers)
 mkdir -p /mnt/xzm /mnt/newroot
-LOWER=""
-IDX=0
+LOWER="" IDX=0
 
-for xzm in "$porteux_DIR/base/"*.xzm; do
+for xzm in "$porteux_DIR/base/"*.xzm "$porteux_DIR/modules/"*.xzm; do
     [ -f "$xzm" ] || continue
     mp="/mnt/xzm/$IDX"
     mkdir -p "$mp"
@@ -783,148 +743,105 @@ for xzm in "$porteux_DIR/base/"*.xzm; do
         p "  +${xzm##*/}"
         LOWER="${LOWER:+$LOWER:}$mp"
         IDX=$((IDX+1))
-    else
-        p "  GAGAL mount: ${xzm##*/}"
     fi
-done
-
-for xzm in "$porteux_DIR/modules/"*.xzm; do
-    [ -f "$xzm" ] || continue
-    mp="/mnt/xzm/$IDX"
-    mkdir -p "$mp"
-    mount -t squashfs -o loop,ro "$xzm" "$mp" 2>/dev/null && {
-        LOWER="${LOWER:+$LOWER:}$mp"
-        IDX=$((IDX+1))
-    }
 done
 
 [ -n "$LOWER" ] || { p "GAGAL: tidak ada .xzm ter-mount"; die_shell; }
 p "  $IDX modul dimuat"
 
-# OverlayFS: upperdir dan workdir WAJIB di filesystem yang sama
-# Solusi: buat satu tmpfs di /mnt/cow, lalu buat subdir di dalamnya
 mkdir -p /mnt/cow
 mount -t tmpfs -o mode=0755 tmpfs /mnt/cow
 mkdir -p /mnt/cow/upper /mnt/cow/work
 
 p "mount overlay..."
-mount -t overlay overlay     -o "lowerdir=$LOWER,upperdir=/mnt/cow/upper,workdir=/mnt/cow/work"     /mnt/newroot || {
-    p "GAGAL overlay — dmesg:"
-    dmesg 2>/dev/null | tail -5
-    die_shell
-}
+mount -t overlay overlay \
+    -o "lowerdir=$LOWER,upperdir=/mnt/cow/upper,workdir=/mnt/cow/work" \
+    /mnt/newroot || { p "GAGAL overlay"; dmesg 2>/dev/null | tail -5; die_shell; }
 p "overlay OK"
 
-# ── 6. Siapkan /dev /proc /sys di newroot ────────────────────────────────────
+# ── 6. Setup /dev /proc /sys di newroot ──────────────────────────────────────
 p "pindah ke newroot..."
+mkdir -p /mnt/newroot/dev /mnt/newroot/proc /mnt/newroot/sys \
+         /mnt/newroot/run /mnt/newroot/tmp
 
-# Bind mount /dev (lebih reliable dari mount --move untuk devtmpfs)
-mkdir -p /mnt/newroot/dev /mnt/newroot/proc /mnt/newroot/sys          /mnt/newroot/run /mnt/newroot/tmp
-
-mount --bind /dev  /mnt/newroot/dev  2>/dev/null ||     mount -t devtmpfs devtmpfs /mnt/newroot/dev 2>/dev/null || true
+mount --bind /dev  /mnt/newroot/dev  2>/dev/null || \
+    mount -t devtmpfs devtmpfs /mnt/newroot/dev 2>/dev/null || true
 mkdir -p /mnt/newroot/dev/pts
-mount --bind /dev/pts /mnt/newroot/dev/pts 2>/dev/null ||     mount -t devpts devpts /mnt/newroot/dev/pts 2>/dev/null || true
-mount --bind /proc /mnt/newroot/proc 2>/dev/null ||     mount -t proc proc /mnt/newroot/proc 2>/dev/null || true
-mount --bind /sys  /mnt/newroot/sys  2>/dev/null ||     mount -t sysfs sysfs /mnt/newroot/sys 2>/dev/null || true
+mount --bind /dev/pts /mnt/newroot/dev/pts 2>/dev/null || \
+    mount -t devpts devpts /mnt/newroot/dev/pts 2>/dev/null || true
+mount --bind /proc /mnt/newroot/proc 2>/dev/null || \
+    mount -t proc proc /mnt/newroot/proc 2>/dev/null || true
+mount --bind /sys /mnt/newroot/sys 2>/dev/null || \
+    mount -t sysfs sysfs /mnt/newroot/sys 2>/dev/null || true
 mount -t tmpfs tmpfs /mnt/newroot/run 2>/dev/null || true
 mount -t tmpfs tmpfs /mnt/newroot/tmp 2>/dev/null || true
+[ -c /mnt/newroot/dev/console ] || \
+    mknod -m 600 /mnt/newroot/dev/console c 5 1 2>/dev/null || true
 
-# Pastikan /dev/console ada di newroot sebelum switch_root
-[ -c /mnt/newroot/dev/console ] ||     mknod -m 600 /mnt/newroot/dev/console c 5 1 2>/dev/null || true
-
-# ── 7. Bangun GoboLinux System/Index ─────────────────────────────────────────
-# Tanpa ini /sbin/init tidak ada karena GoboLinux simpan binary di Programs/
-p "bangun System/Index..."
-mkdir -p /mnt/newroot/System/Index/bin          /mnt/newroot/System/Index/lib          /mnt/newroot/System/Index/include          /mnt/newroot/System/Settings
-
+# ── 7. Resolve Current symlinks HANYA untuk program yang dibutuhkan boot ─────
+# TIDAK membangun seluruh System/Index — itu tugas GoboLinux sendiri saat boot
+# Kita hanya pastikan symlink Current ada agar GoboLinux bisa boot normal
+p "resolve Current symlinks..."
 if [ -d /mnt/newroot/Programs ]; then
     for prog_dir in /mnt/newroot/Programs/*/; do
         [ -d "$prog_dir" ] || continue
-
-        # Resolve Current symlink
-        if [ -L "${prog_dir}Current" ]; then
-            ver=$(readlink -f "${prog_dir}Current" 2>/dev/null)
-        else
-            ver=""
-            for vd in "${prog_dir}"*/; do
-                [ -d "$vd" ] && ver="$vd"
-            done
-            ver="${ver%/}"
-        fi
-        [ -d "$ver" ] || continue
-
-        # Buat Current jika belum ada
-        [ -e "${prog_dir}Current" ] ||             ln -snf "$ver" "${prog_dir}Current" 2>/dev/null
-
-        # Executables: bin/ sbin/
-        for sub in bin sbin; do
-            [ -d "$ver/$sub" ] || continue
-            for f in "$ver/$sub/"*; do
-                [ -e "$f" ] || continue
-                fn="${f##*/}"
-                dst="/mnt/newroot/System/Index/bin/$fn"
-                [ -e "$dst" ] || ln -s "$f" "$dst" 2>/dev/null
-            done
+        [ -L "${prog_dir}Current" ] && continue  # sudah ada, skip
+        # Cari versi terbaru dan buat Current
+        latest=""
+        for vd in "${prog_dir}"*/; do
+            [ -d "$vd" ] && latest="$vd"
         done
-
-        # Libraries: lib/ lib64/
-        for sub in lib lib64; do
-            [ -d "$ver/$sub" ] || continue
-            for f in "$ver/$sub/"*; do
-                [ -e "$f" ] || continue
-                fn="${f##*/}"
-                dst="/mnt/newroot/System/Index/lib/$fn"
-                [ -e "$dst" ] || ln -s "$f" "$dst" 2>/dev/null
-            done
-        done
+        [ -n "$latest" ] && \
+            ln -snf "${latest%/}" "${prog_dir}Current" 2>/dev/null || true
     done
-    p "  System/Index selesai"
+    p "  Current symlinks selesai"
 fi
 
-# FHS compatibility symlinks di newroot
-# GoboLinux: /bin -> /System/Index/bin, dll
-for pair in     "bin:/System/Index/bin"     "sbin:/System/Index/bin"     "lib:/System/Index/lib"     "lib64:/System/Index/lib"; do
+# ── 8. FHS symlinks minimal ──────────────────────────────────────────────────
+# GoboLinux 017 pakai System/Index — buat FHS symlinks yang menunjuk ke sana
+# Ini HANYA untuk memastikan switch_root bisa menemukan /sbin/init
+for pair in \
+    "bin:/System/Index/bin" \
+    "sbin:/System/Index/bin" \
+    "lib:/System/Index/lib" \
+    "lib64:/System/Index/lib"; do
     lnk="${pair%%:*}"; tgt="${pair#*:}"
-    [ -e "/mnt/newroot/$lnk" ] ||         ln -s "$tgt" "/mnt/newroot/$lnk" 2>/dev/null || true
+    [ -e "/mnt/newroot/$lnk" ] || \
+        ln -s "$tgt" "/mnt/newroot/$lnk" 2>/dev/null || true
 done
 [ -e /mnt/newroot/usr ] || ln -s "/" /mnt/newroot/usr 2>/dev/null || true
 
-# ── 8. Jalankan InitializeCurrent jika ada ───────────────────────────────────
-INIT_CURRENT="/mnt/newroot/System/Settings/BootScripts/InitializeCurrent"
-if [ -x "$INIT_CURRENT" ]; then
-    p "  Menjalankan InitializeCurrent..."
-    chroot /mnt/newroot /System/Settings/BootScripts/InitializeCurrent 2>/dev/null || true
-fi
-
 # ── 9. Cari init GoboLinux ───────────────────────────────────────────────────
-p "isi newroot:"
-for d in /mnt/newroot/*/; do p "  ${d#/mnt/newroot/}"; done
-
+p "isi newroot: $(ls /mnt/newroot/ 2>/dev/null | tr '\n' ' ')"
 INIT=""
-for candidate in     /mnt/newroot/sbin/init     /mnt/newroot/System/Index/bin/init     /mnt/newroot/bin/init     /mnt/newroot/Programs/Sysvinit/Current/sbin/init     /mnt/newroot/Programs/Systemd/Current/lib/systemd/systemd     /mnt/newroot/Programs/Systemd/Current/bin/systemd; do
+for candidate in \
+    /mnt/newroot/sbin/init \
+    /mnt/newroot/System/Index/bin/init \
+    /mnt/newroot/bin/init \
+    /mnt/newroot/Programs/Sysvinit/Current/sbin/init \
+    /mnt/newroot/Programs/Systemd/Current/lib/systemd/systemd \
+    /mnt/newroot/Programs/Systemd/Current/bin/systemd; do
     if [ -x "$candidate" ]; then
         INIT="${candidate#/mnt/newroot}"
-        p "init ditemukan: $INIT"
+        p "init: $INIT"
         break
     fi
 done
 
 if [ -z "$INIT" ]; then
-    p "init tidak ditemukan di path standar"
-    p "Cari di Programs/:"
+    p "init tidak ditemukan! Programs/:"
     for d in /mnt/newroot/Programs/*/; do
-        [ -d "$d" ] && p "  ${d##/mnt/newroot/}"
+        [ -d "$d" ] && p "  ${d##/mnt/newroot/Programs/}"
     done
-    # Fallback ke sh — akan gagal tapi setidaknya tidak kernel panic
+    p "System/Index/bin:"
+    ls /mnt/newroot/System/Index/bin/ 2>/dev/null | head -10 | while read f; do p "  $f"; done
     INIT="/bin/sh"
-    p "fallback: $INIT"
 fi
 
 p "exec switch_root -> $INIT"
 exec switch_root /mnt/newroot "$INIT"
 p "switch_root GAGAL"
 die_shell
-
 INIT_EOF
 
     chmod 755 "$INITRD_DIR/init"
