@@ -669,9 +669,6 @@ p() { echo "[init] $*"; }
 
 die_shell() {
     p "=== SHELL DARURAT ==="
-    p "/proc/partitions:"; cat /proc/partitions 2>/dev/null
-    p "/dev:"; ls /dev/ 2>/dev/null
-    p "dmesg:"; dmesg 2>/dev/null | tail -20
     exec setsid sh -c 'exec sh </dev/console >/dev/console 2>&1'
 }
 
@@ -756,11 +753,11 @@ mkdir -p /mnt/cow/upper /mnt/cow/work
 p "mount overlay..."
 mount -t overlay overlay \
     -o "lowerdir=$LOWER,upperdir=/mnt/cow/upper,workdir=/mnt/cow/work" \
-    /mnt/newroot || { p "GAGAL overlay"; dmesg 2>/dev/null | tail -5; die_shell; }
+    /mnt/newroot || { p "GAGAL overlay"; die_shell; }
 p "overlay OK"
 
 # ── 6. Setup /dev /proc /sys di newroot ──────────────────────────────────────
-p "pindah ke newroot..."
+p "setup newroot fs..."
 mkdir -p /mnt/newroot/dev /mnt/newroot/proc /mnt/newroot/sys \
          /mnt/newroot/run /mnt/newroot/tmp
 
@@ -778,41 +775,85 @@ mount -t tmpfs tmpfs /mnt/newroot/tmp 2>/dev/null || true
 [ -c /mnt/newroot/dev/console ] || \
     mknod -m 600 /mnt/newroot/dev/console c 5 1 2>/dev/null || true
 
-# ── 7. Resolve Current symlinks HANYA untuk program yang dibutuhkan boot ─────
-# TIDAK membangun seluruh System/Index — itu tugas GoboLinux sendiri saat boot
-# Kita hanya pastikan symlink Current ada agar GoboLinux bisa boot normal
+# ── 7. Resolve Current symlinks ───────────────────────────────────────────────
 p "resolve Current symlinks..."
 if [ -d /mnt/newroot/Programs ]; then
     for prog_dir in /mnt/newroot/Programs/*/; do
         [ -d "$prog_dir" ] || continue
-        [ -L "${prog_dir}Current" ] && continue  # sudah ada, skip
-        # Cari versi terbaru dan buat Current
+        [ -L "${prog_dir}Current" ] && continue
         latest=""
-        for vd in "${prog_dir}"*/; do
-            [ -d "$vd" ] && latest="$vd"
-        done
+        for vd in "${prog_dir}"*/; do [ -d "$vd" ] && latest="$vd"; done
         [ -n "$latest" ] && \
             ln -snf "${latest%/}" "${prog_dir}Current" 2>/dev/null || true
     done
-    p "  Current symlinks selesai"
+fi
+p "  Current selesai"
+
+# ── 8. Bangun System/Index dari Programs/ ─────────────────────────────────────
+# System/Index di GoboLinux 017 diisi runtime oleh Scripts package
+# Saat boot live, System/Index kosong — kita isi dari Programs/*/Current/
+p "bangun System/Index..."
+mkdir -p /mnt/newroot/System/Index/bin \
+         /mnt/newroot/System/Index/lib \
+         /mnt/newroot/System/Index/lib64 \
+         /mnt/newroot/System/Index/include \
+         /mnt/newroot/System/Index/share
+
+if [ -d /mnt/newroot/Programs ]; then
+    for prog_dir in /mnt/newroot/Programs/*/; do
+        [ -d "$prog_dir" ] || continue
+        ver="${prog_dir}Current"
+        [ -L "$ver" ] || continue
+        ver=$(readlink -f "$ver" 2>/dev/null)
+        [ -d "$ver" ] || continue
+
+        # bin/ sbin/ → System/Index/bin/
+        for sub in bin sbin; do
+            [ -d "$ver/$sub" ] || continue
+            for f in "$ver/$sub/"*; do
+                [ -e "$f" ] || continue
+                fn="${f##*/}"
+                [ -e "/mnt/newroot/System/Index/bin/$fn" ] || \
+                    ln -s "$f" "/mnt/newroot/System/Index/bin/$fn" 2>/dev/null
+            done
+        done
+
+        # lib/ lib64/ → System/Index/lib/
+        for sub in lib lib64; do
+            [ -d "$ver/$sub" ] || continue
+            for f in "$ver/$sub/"*; do
+                [ -e "$f" ] || continue
+                fn="${f##*/}"
+                [ -e "/mnt/newroot/System/Index/lib/$fn" ] || \
+                    ln -s "$f" "/mnt/newroot/System/Index/lib/$fn" 2>/dev/null
+            done
+        done
+    done
 fi
 
-# ── 8. FHS symlinks minimal ──────────────────────────────────────────────────
-# GoboLinux 017 pakai System/Index — buat FHS symlinks yang menunjuk ke sana
-# Ini HANYA untuk memastikan switch_root bisa menemukan /sbin/init
+idx_bin=$(ls /mnt/newroot/System/Index/bin/ 2>/dev/null | wc -l)
+idx_lib=$(ls /mnt/newroot/System/Index/lib/ 2>/dev/null | wc -l)
+p "  System/Index/bin: $idx_bin entries"
+p "  System/Index/lib: $idx_lib entries"
+
+# ── 9. FHS symlinks ──────────────────────────────────────────────────────────
+p "FHS symlinks..."
 for pair in \
     "bin:/System/Index/bin" \
     "sbin:/System/Index/bin" \
     "lib:/System/Index/lib" \
     "lib64:/System/Index/lib"; do
     lnk="${pair%%:*}"; tgt="${pair#*:}"
-    [ -e "/mnt/newroot/$lnk" ] || \
-        ln -s "$tgt" "/mnt/newroot/$lnk" 2>/dev/null || true
+    if [ -e "/mnt/newroot/$lnk" ]; then
+        p "  /newroot/$lnk sudah ada"
+    else
+        ln -s "$tgt" "/mnt/newroot/$lnk" 2>/dev/null && p "  /newroot/$lnk -> $tgt"
+    fi
 done
 [ -e /mnt/newroot/usr ] || ln -s "/" /mnt/newroot/usr 2>/dev/null || true
 
-# ── 9. Cari init GoboLinux ───────────────────────────────────────────────────
-p "isi newroot: $(ls /mnt/newroot/ 2>/dev/null | tr '\n' ' ')"
+# ── 10. Cari init ─────────────────────────────────────────────────────────────
+p "cari init..."
 INIT=""
 for candidate in \
     /mnt/newroot/sbin/init \
@@ -822,21 +863,32 @@ for candidate in \
     /mnt/newroot/Programs/Systemd/Current/lib/systemd/systemd \
     /mnt/newroot/Programs/Systemd/Current/bin/systemd; do
     if [ -x "$candidate" ]; then
+        real=$(readlink -f "$candidate" 2>/dev/null || echo "$candidate")
+        p "  ditemukan: ${candidate#/mnt/newroot} -> ${real#/mnt/newroot}"
         INIT="${candidate#/mnt/newroot}"
-        p "init: $INIT"
         break
     fi
 done
 
-if [ -z "$INIT" ]; then
-    p "init tidak ditemukan! Programs/:"
-    for d in /mnt/newroot/Programs/*/; do
-        [ -d "$d" ] && p "  ${d##/mnt/newroot/Programs/}"
+[ -n "$INIT" ] || {
+    p "  init tidak ditemukan!"
+    p "  System/Index/bin (10 pertama):"
+    ls /mnt/newroot/System/Index/bin/ 2>/dev/null | head -10 | \
+        while read -r f; do p "    $f"; done
+    # Coba cari langsung di Programs
+    for prog in Sysvinit SysVInit Openrc S6 Runit; do
+        f=$(find /mnt/newroot/Programs/$prog 2>/dev/null -name "init" -type f | head -1)
+        [ -n "$f" ] && { p "  init di $f"; INIT="${f#/mnt/newroot}"; break; }
     done
-    p "System/Index/bin:"
-    ls /mnt/newroot/System/Index/bin/ 2>/dev/null | head -10 | while read f; do p "  $f"; done
+}
+
+[ -n "$INIT" ] || {
+    p "  FATAL: tidak ada init. Masuk shell debug..."
+    # Salin busybox ke newroot agar shell bisa jalan
+    cp /bin/busybox /mnt/newroot/bin/busybox 2>/dev/null || true
+    ln -sf busybox /mnt/newroot/bin/sh 2>/dev/null || true
     INIT="/bin/sh"
-fi
+}
 
 p "exec switch_root -> $INIT"
 exec switch_root /mnt/newroot "$INIT"
