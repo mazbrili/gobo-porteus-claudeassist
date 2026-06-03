@@ -782,113 +782,144 @@ if [ -d /mnt/newroot/Programs ]; then
         [ -d "$prog_dir" ] || continue
         [ -L "${prog_dir}Current" ] && continue
         latest=""
-        for vd in "${prog_dir}"*/; do [ -d "$vd" ] && latest="$vd"; done
-        [ -n "$latest" ] && \
-            ln -snf "${latest%/}" "${prog_dir}Current" 2>/dev/null || true
+        for vd in "${prog_dir}"*/; do [ -d "$vd" ] && latest="${vd%/}"; done
+        [ -n "$latest" ] && ln -snf "$latest" "${prog_dir}Current" 2>/dev/null || true
     done
 fi
 p "  Current selesai"
 
 # ── 8. Bangun System/Index dari Programs/ ─────────────────────────────────────
-# System/Index di GoboLinux 017 diisi runtime oleh Scripts package
-# Saat boot live, System/Index kosong — kita isi dari Programs/*/Current/
+# System/Index kosong saat boot live — isi dari Programs/*/Current/
+# Gunakan hanya sh built-in, TIDAK pakai: head, tail, grep, wc, find, tr
 p "bangun System/Index..."
 mkdir -p /mnt/newroot/System/Index/bin \
          /mnt/newroot/System/Index/lib \
-         /mnt/newroot/System/Index/lib64 \
-         /mnt/newroot/System/Index/include \
-         /mnt/newroot/System/Index/share
+         /mnt/newroot/System/Index/lib64
 
+NR=0
 if [ -d /mnt/newroot/Programs ]; then
     for prog_dir in /mnt/newroot/Programs/*/; do
         [ -d "$prog_dir" ] || continue
-        ver="${prog_dir}Current"
-        [ -L "$ver" ] || continue
-        ver=$(readlink -f "$ver" 2>/dev/null)
+
+        # Resolve Current — ambil path langsung dari symlink
+        cur="${prog_dir}Current"
+        [ -L "$cur" ] || continue
+        # readlink tanpa -f: ambil target relatif/absolut dari symlink
+        ver=$(readlink "$cur" 2>/dev/null)
+        # Jika relatif, jadikan absolut
+        case "$ver" in
+            /*) ;;                              # sudah absolut
+            *)  ver="${prog_dir}${ver}" ;;      # relatif → absolut
+        esac
         [ -d "$ver" ] || continue
+
+        NR=$((NR+1))
 
         # bin/ sbin/ → System/Index/bin/
         for sub in bin sbin; do
-            [ -d "$ver/$sub" ] || continue
-            for f in "$ver/$sub/"*; do
+            d="$ver/$sub"
+            [ -d "$d" ] || continue
+            for f in "$d/"*; do
                 [ -e "$f" ] || continue
                 fn="${f##*/}"
-                [ -e "/mnt/newroot/System/Index/bin/$fn" ] || \
-                    ln -s "$f" "/mnt/newroot/System/Index/bin/$fn" 2>/dev/null
+                dst="/mnt/newroot/System/Index/bin/$fn"
+                [ -e "$dst" ] || ln -s "$f" "$dst" 2>/dev/null
             done
         done
 
         # lib/ lib64/ → System/Index/lib/
         for sub in lib lib64; do
-            [ -d "$ver/$sub" ] || continue
-            for f in "$ver/$sub/"*; do
+            d="$ver/$sub"
+            [ -d "$d" ] || continue
+            for f in "$d/"*; do
                 [ -e "$f" ] || continue
                 fn="${f##*/}"
-                [ -e "/mnt/newroot/System/Index/lib/$fn" ] || \
-                    ln -s "$f" "/mnt/newroot/System/Index/lib/$fn" 2>/dev/null
+                dst="/mnt/newroot/System/Index/lib/$fn"
+                [ -e "$dst" ] || ln -s "$f" "$dst" 2>/dev/null
             done
         done
     done
 fi
 
-idx_bin=$(ls /mnt/newroot/System/Index/bin/ 2>/dev/null | wc -l)
-idx_lib=$(ls /mnt/newroot/System/Index/lib/ 2>/dev/null | wc -l)
-p "  System/Index/bin: $idx_bin entries"
-p "  System/Index/lib: $idx_lib entries"
+# Hitung entries tanpa wc/ls pipe — pakai glob
+bin_count=0
+for f in /mnt/newroot/System/Index/bin/*; do [ -e "$f" ] && bin_count=$((bin_count+1)); done
+lib_count=0
+for f in /mnt/newroot/System/Index/lib/*; do [ -e "$f" ] && lib_count=$((lib_count+1)); done
+p "  Programs diproses: $NR"
+p "  System/Index/bin: $bin_count entries"
+p "  System/Index/lib: $lib_count entries"
 
 # ── 9. FHS symlinks ──────────────────────────────────────────────────────────
-p "FHS symlinks..."
 for pair in \
     "bin:/System/Index/bin" \
     "sbin:/System/Index/bin" \
     "lib:/System/Index/lib" \
     "lib64:/System/Index/lib"; do
     lnk="${pair%%:*}"; tgt="${pair#*:}"
-    if [ -e "/mnt/newroot/$lnk" ]; then
-        p "  /newroot/$lnk sudah ada"
-    else
-        ln -s "$tgt" "/mnt/newroot/$lnk" 2>/dev/null && p "  /newroot/$lnk -> $tgt"
-    fi
+    [ -e "/mnt/newroot/$lnk" ] || \
+        ln -s "$tgt" "/mnt/newroot/$lnk" 2>/dev/null
 done
 [ -e /mnt/newroot/usr ] || ln -s "/" /mnt/newroot/usr 2>/dev/null || true
 
 # ── 10. Cari init ─────────────────────────────────────────────────────────────
 p "cari init..."
-INIT=""
-for candidate in \
-    /mnt/newroot/sbin/init \
-    /mnt/newroot/System/Index/bin/init \
-    /mnt/newroot/bin/init \
-    /mnt/newroot/Programs/Sysvinit/Current/sbin/init \
-    /mnt/newroot/Programs/Systemd/Current/lib/systemd/systemd \
-    /mnt/newroot/Programs/Systemd/Current/bin/systemd; do
-    if [ -x "$candidate" ]; then
-        real=$(readlink -f "$candidate" 2>/dev/null || echo "$candidate")
-        p "  ditemukan: ${candidate#/mnt/newroot} -> ${real#/mnt/newroot}"
-        INIT="${candidate#/mnt/newroot}"
-        break
-    fi
+
+# Tampilkan semua Programs yang ada untuk diagnosis
+p "  Programs tersedia:"
+for prog_dir in /mnt/newroot/Programs/*/; do
+    [ -d "$prog_dir" ] || continue
+    pname="${prog_dir%/}"; pname="${pname##*/}"
+    p "    $pname"
 done
 
-[ -n "$INIT" ] || {
-    p "  init tidak ditemukan!"
-    p "  System/Index/bin (10 pertama):"
-    ls /mnt/newroot/System/Index/bin/ 2>/dev/null | head -10 | \
-        while read -r f; do p "    $f"; done
-    # Coba cari langsung di Programs
-    for prog in Sysvinit SysVInit Openrc S6 Runit; do
-        f=$(find /mnt/newroot/Programs/$prog 2>/dev/null -name "init" -type f | head -1)
-        [ -n "$f" ] && { p "  init di $f"; INIT="${f#/mnt/newroot}"; break; }
+# Cari init binary langsung di setiap program
+# GoboLinux 017 pakai: SysVInit, Sysvinit, sysvinit (huruf besar/kecil beda)
+INIT=""
+for prog_dir in /mnt/newroot/Programs/*/; do
+    [ -d "$prog_dir" ] || continue
+    pname="${prog_dir%/}"; pname="${pname##*/}"
+
+    # Resolve versi
+    cur="${prog_dir}Current"
+    if [ -L "$cur" ]; then
+        ver=$(readlink "$cur")
+        case "$ver" in /*) ;; *) ver="${prog_dir}${ver}" ;; esac
+    else
+        ver=""
+        for vd in "${prog_dir}"*/; do [ -d "$vd" ] && ver="${vd%/}"; done
+    fi
+    [ -d "$ver" ] || continue
+
+    # Cek sbin/init dan bin/init di setiap program
+    for sub in sbin bin; do
+        ibin="$ver/$sub/init"
+        if [ -x "$ibin" ]; then
+            p "  FOUND: $pname/$sub/init"
+            INIT="${ibin#/mnt/newroot}"
+            break 2
+        fi
+    done
+done
+
+# Fallback: cek path via System/Index
+[ -z "$INIT" ] && [ -x /mnt/newroot/System/Index/bin/init ] &&     INIT="/System/Index/bin/init"
+[ -z "$INIT" ] && [ -x /mnt/newroot/sbin/init ] && INIT="/sbin/init"
+[ -z "$INIT" ] && [ -x /mnt/newroot/bin/init ]  && INIT="/bin/init"
+
+# Systemd fallback
+[ -z "$INIT" ] && {
+    for sd in         /mnt/newroot/Programs/Systemd/Current/lib/systemd/systemd         /mnt/newroot/Programs/Systemd/Current/bin/systemd         /mnt/newroot/lib/systemd/systemd; do
+        [ -x "$sd" ] && { INIT="${sd#/mnt/newroot}"; break; }
     done
 }
 
-[ -n "$INIT" ] || {
-    p "  FATAL: tidak ada init. Masuk shell debug..."
-    # Salin busybox ke newroot agar shell bisa jalan
+if [ -z "$INIT" ]; then
+    p "  FATAL: copy busybox ke newroot untuk shell debug"
     cp /bin/busybox /mnt/newroot/bin/busybox 2>/dev/null || true
     ln -sf busybox /mnt/newroot/bin/sh 2>/dev/null || true
     INIT="/bin/sh"
-}
+fi
 
 p "exec switch_root -> $INIT"
 exec switch_root /mnt/newroot "$INIT"
