@@ -634,13 +634,31 @@ build_000_kernel() {
 }
 
 # ── 001-base.xzm ──────────────────────────────────────────────────────────────
+# ──|-----handy-ruler------------------------------------------------------|
 BASE_PROGS=(
-    Glibc Bash BusyBox Coreutils Util-linux Kmod
-    E2fsprogs Shadow Kbd Procps Sed Grep Gawk
-    Findutils Diffutils Which File Less Tar
-    Gzip Bzip2 Xz PCRE PCRE2 Readline Ncurses NcursesW
-    Zlib Openssl Ca-certificates Curl Wget
-    Udev Eudev Acpid Dbus Linux-PAM Sysfsutils Psmisc
+#    Glibc Bash BusyBox Coreutils Util-linux Kmod
+#    E2fsprogs Shadow Kbd Procps Sed Grep Gawk
+#    Findutils Diffutils Which File Less Tar
+#    Gzip Bzip2 Xz PCRE PCRE2 Readline Ncurses NcursesW
+#    Zlib Openssl Ca-certificates Curl Wget
+#    Udev Eudev Acpid Dbus Linux-PAM Sysfsutils Psmisc
+#   |-----handy-ruler------------------------------------------------------|
+#   di gobo ada tapi di slack tidak pakai , python kelihatannya harus ada
+    APR APR-Util At-Spi2-ATK At-Spi2-Core Python Python3
+#   di porteux ada
+    ACL Acpid ATTR Bash BC Bluez Bridge-Utils Bzip2 CA-Certificates
+    CAcerts CoreUtils Cpio Curl Cyrus-SASL DBus DBus-GLib
+    DHCPCD Dialog DiffUtils Dmidecode DosFSTools E2FSProgs Ethtool Eudev
+    File FindUtils Fuse Gawk GD GDBM Gettext GLib Glibc Glib-Networking
+    GnuTLS GoboHide GoboLight GoboNet Grep GRUB GRUB-EFI Gzip
+    Hdparm InetUtils IPRoute2 Iptables KBD Kernel Kmod Less
+    LibAIO LibArchive LibAssuan LibCap LibFFI LibGCrypt LibGPG-Error
+    LibGUdev LibICU4C LibIDN LibIDN2 LibPSL LibXML2 Linux-PAM LM-Sensors
+    Lsof LVM2 Lynx LZ4 LZip LZO MC Mdadm NcursesW Nettle Net-Tools
+    NTFS-3G OpenSSH OpenSSL Propcs-NG P11-Kit Parted Rsync Sed SQLite
+    SquashFS-Tools SSHFS Sudo SysFSUtils Sysklogd Sysvinit Tar Tcl Tree
+    Unzip Util-linux USBUtils Wget Wireless-Tools XZ-Utils ZLib ZSH Zstd
+
 )
 
 # ── Refaktor Fungsi Build (Contoh 001-base) ──────────────────────────────────
@@ -672,9 +690,12 @@ build_001_base() {
 
 # ── 002-gobotool.xzm ─────────────────────────────────────────────────────────────
 TOOLS_PROGS=(
-    Scripts Compile Manager GoboNet Freshen
-    Python3 Python Git Perl
-    OpenSSH Sudo Nano Vim GoboHide AbsTK Lua
+#   |-----handy-ruler------------------------------------------------------|
+#    Scripts Compile Manager GoboNet Freshen
+#    Python3 Python Git Perl
+#    OpenSSH Sudo Nano Vim GoboHide AbsTK Lua
+    AbsTK BootScripts Compile ConfigTools EnhancedSkel Freshen Installer 
+    Listener Scripts
 )
 
 build_002_gobotool() {
@@ -695,15 +716,78 @@ build_002_gobotool() {
     make_xzm "$staging" "$OUTPUT_DIR/porteux/base/002-gobotool.xzm" "002-gobotool.xzm"
 }
 
+# ── Build 002-gobo-rest.xzm (Struktur Folder GoboLinux 016/017 Sisa) ──────────
+build_002_gobo_rest() {
+    local base_dir="$OUTPUT_DIR/porteux/base"
+    local staging="$WORK_DIR/staging-002-gobo-rest"
+    rm -rf "$staging" && mkdir -p "$staging"
+
+    log "Menyusun staging untuk 002-gobo-rest.xzm (Struktur Folder GoboLinux)..."
+
+    # 1. Ambil folder sistem dasar GoboLinux di root "/"
+    # Mengabaikan folder /Programs karena dihandle modul lain, tetapi menyalin sisanya.
+    for folder in System Data Mount Users Depots Files Library; do
+        if [ -d "$GOBO_ROOT_DIR/$folder" ]; then
+            info "  Menduplikasi folder: /$folder"
+            mkdir -p "$staging/$folder"
+            # Salin struktur dan file di dalamnya (kecuali folder besar Programs jika ada)
+            rsync -a --exclude="/Programs" "$GOBO_ROOT_DIR/$folder/" "$staging/$folder/"
+        fi
+    done
+
+    # 2. Ambil symlink legasi/standar Linux di root "/" (seperti /bin, /sbin, /lib, /usr, /root, dll)
+    # GoboLinux menggunakan symlink ini untuk mengarah ke /System/Index/...
+    info "  Menyalin symlink root standar Linux..."
+    find "$GOBO_ROOT_DIR" -maxdepth 1 -type l | while read -r link; do
+        local link_name
+        link_name=$(basename "$link")
+        local link_target
+        link_target=$(readlink "$link")
+        ln -sf "$link_target" "$staging/$link_name"
+    done
+
+    # 3. Pastikan folder mountpoint kosong umum selalu tersedia
+    # Ditambahkan cek [ ! -e ... ] dan [ ! -L ... ] agar tidak bentrok jika sudah ada/berbentuk symlink
+    for mnt in dev proc sys run tmp mnt media root; do
+        if [ ! -e "$staging/$mnt" ] && [ ! -L "$staging/$mnt" ]; then
+            mkdir -p "$staging/$mnt"
+        fi
+    done
+    
+    # Pastikan permission folder tmp benar
+    chmod 1777 "$staging/tmp"
+
+    # 4. Bungkus menjadi modul xzm
+    make_xzm "$staging" "$base_dir/002-gobo-rest.xzm" "002-gobo-rest.xzm"
+    rm -rf "$staging"
+}
+
 # ── 003-xorg.xzm ─────────────────────────────────────────────────────────────
 XORG_PROGS=(
-    Xorg Xterm Xinit Xrandr Xsetroot Xauth
-    Mesa LibDRM LibGLVND
-    FontConfig FreeType HarfBuzz
-    LibX11 LibXext LibXrender LibXft LibXi LibXtst
-    LibXfixes LibXcomposite LibXdamage LibXrandr
-    Pixman Cairo Pango
-    LibPng LibJpeg-turbo LibTiff
+#    Xorg Xterm Xinit Xrandr Xsetroot Xauth
+#    Mesa LibDRM LibGLVND
+#    FontConfig FreeType HarfBuzz
+#    LibX11 LibXext LibXrender LibXft LibXi LibXtst
+#    LibXfixes LibXcomposite LibXdamage LibXrandr
+#    Pixman Cairo Pango
+#    LibPng LibJpeg-turbo LibTiff
+    ALSA-Utils ALSA-UCM-Conf ALSA-Lib ALSA-Firmware ATK ATKMM At-Spi2-Core
+    At-Spi2-ATK Audiofile Cairo Cairomm DB DejaVu-Fonts-TTF Desktop-File-Utils 
+    Flac Fontconfig FreeGlut FreeType Fribidi GDK-Pixbuf Giflib Glibmm Gparted
+    Gobject-Introspection Graphite2 GSL GTKMM HarfBuzz Hicolor-Icon-Theme
+    ICEAuth JSON-Glib Json-C Lame LCMS LibCanberra Lesstif LibDRM LibDMX
+    LibEpoxy LibEvdev LibEvent LibFontenc LibGLVnd LibiCal LibICE LibJPEG-Turbo
+    LibNotify LibOGG LibPCIAccess LibPNG LibPthread-Stubs LibSecret LibSigc++
+    LibSM LibSndfile LibTheora LibUnwind LibVA LibVDPAU LibVorbis LibWebP LibX11
+    LibXau LibXaw LibXCB LibXcomposite LibXcursor LibXdamage LibXdmcp LibXext
+    LibXfixes LibXfont2 LibXft LibXi LibXinerama LibXKBfile LibXmu LibXpm
+    LibXpresent LibXRandR LibXrender LibXres LibXScrnSaver LibXShmfence
+    LibXSLT LibXt LibXtst LibXv LibXvMC LibXxf86dga LibXxf86vm Mesa MkFontScale
+    MPG123 MtDev ORC Pango PangoMM Poppler Pixman PulseAudio SetXKBMap SDL PulseAudio-Ctl
+    Shared-MIME-info SpeexDSP Startup-Notification WavPack SPICE-Protocol T1Lib
+    XAuth XCB-Util XCB-Util-Image XCB-Util-Renderutil XCB-Util-WM XDG-Utils
+    Xev Xhost Xinit Xorg Xorg-App Xorg-cf-files Xorg-Driver Xorg-Font Xorg-Lib
+    Xorg-Proto Xorg-Server Xpdf Xterm
 )
 
 build_003_xorg() {
@@ -777,7 +861,7 @@ DEV_PROGS=(
     Dbus Udev Eudev Linux-PAM
     Glib GObject-Introspection Atk Gtk+ Gtk+3 Gdk-Pixbuf
     # Scripting
-    Python3 Perl Lua
+    Perl Lua
     # Dev tools
     Git Curl Wget
 )
@@ -984,6 +1068,7 @@ main() {
     # 6. Build modul .xzm
     build_000_kernel
     build_001_base
+	build_002_gobo_rest
     build_002_gobotool
     build_003_xorg
     build_004_desktop
