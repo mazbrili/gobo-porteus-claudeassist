@@ -775,71 +775,6 @@ mount -t tmpfs tmpfs /mnt/newroot/tmp 2>/dev/null || true
 [ -c /mnt/newroot/dev/console ] || \
     mknod -m 600 /mnt/newroot/dev/console c 5 1 2>/dev/null || true
 
-# ── 7. Resolve Current symlinks ───────────────────────────────────────────────
-p "resolve Current symlinks..."
-if [ -d /mnt/newroot/Programs ]; then
-    for prog_dir in /mnt/newroot/Programs/*/; do
-        [ -d "$prog_dir" ] || continue
-        [ -L "${prog_dir}Current" ] && continue
-        latest=""
-        for vd in "${prog_dir}"*/; do [ -d "$vd" ] && latest="${vd%/}"; done
-        [ -n "$latest" ] && ln -snf "$latest" "${prog_dir}Current" 2>/dev/null || true
-    done
-fi
-p "  Current selesai"
-
-# ── 8. Bangun System/Index dari Programs/ ─────────────────────────────────────
-# System/Index kosong saat boot live — isi dari Programs/*/Current/
-# Gunakan hanya sh built-in, TIDAK pakai: head, tail, grep, wc, find, tr
-p "bangun System/Index..."
-mkdir -p /mnt/newroot/System/Index/bin \
-         /mnt/newroot/System/Index/lib \
-         /mnt/newroot/System/Index/lib64
-
-NR=0
-if [ -d /mnt/newroot/Programs ]; then
-    for prog_dir in /mnt/newroot/Programs/*/; do
-        [ -d "$prog_dir" ] || continue
-
-        # Resolve Current — ambil path langsung dari symlink
-        cur="${prog_dir}Current"
-        [ -L "$cur" ] || continue
-        # readlink tanpa -f: ambil target relatif/absolut dari symlink
-        ver=$(readlink "$cur" 2>/dev/null)
-        # Jika relatif, jadikan absolut
-        case "$ver" in
-            /*) ;;                              # sudah absolut
-            *)  ver="${prog_dir}${ver}" ;;      # relatif → absolut
-        esac
-        [ -d "$ver" ] || continue
-
-        NR=$((NR+1))
-
-        # bin/ sbin/ → System/Index/bin/
-        for sub in bin sbin; do
-            d="$ver/$sub"
-            [ -d "$d" ] || continue
-            for f in "$d/"*; do
-                [ -e "$f" ] || continue
-                fn="${f##*/}"
-                dst="/mnt/newroot/System/Index/bin/$fn"
-                [ -e "$dst" ] || ln -s "$f" "$dst" 2>/dev/null
-            done
-        done
-
-        # lib/ lib64/ → System/Index/lib/
-        for sub in lib lib64; do
-            d="$ver/$sub"
-            [ -d "$d" ] || continue
-            for f in "$d/"*; do
-                [ -e "$f" ] || continue
-                fn="${f##*/}"
-                dst="/mnt/newroot/System/Index/lib/$fn"
-                [ -e "$dst" ] || ln -s "$f" "$dst" 2>/dev/null
-            done
-        done
-    done
-fi
 
 # Hitung entries tanpa wc/ls pipe — pakai glob
 bin_count=0
@@ -921,6 +856,85 @@ if [ -z "$INIT" ]; then
     INIT="/bin/sh"
 fi
 
+# ── /etc setup ───────────────────────────────────────────────────────────────
+p "setup /etc..."
+mkdir -p /mnt/newroot/etc
+
+# 1. Coba salin dari System/Settings
+if [ -d /mnt/newroot/System/Settings ]; then
+    for f in /mnt/newroot/System/Settings/*; do
+        [ -e "$f" ] || continue
+        fn="${f##*/}"
+        [ -e "/mnt/newroot/etc/$fn" ] || \
+            cp -a "$f" "/mnt/newroot/etc/$fn" 2>/dev/null || true
+    done
+fi
+
+# 2. Cari inittab dari Programs/Sysvinit (casenya macam-macam di GoboLinux)
+if [ ! -f /mnt/newroot/etc/inittab ]; then
+    for prog_dir in /mnt/newroot/Programs/*/; do
+        [ -d "$prog_dir" ] || continue
+        pname="${prog_dir%/}"; pname="${pname##*/}"
+        case "$pname" in
+            [Ss]ys[Vv][Ii]nit|[Ss]ysvinit|SYSVINIT) ;;
+            *) continue ;;
+        esac
+        cur="${prog_dir}Current"
+        [ -L "$cur" ] || continue
+        ver=$(readlink "$cur")
+        case "$ver" in /*) ;; *) ver="${prog_dir}${ver}" ;; esac
+        if [ -f "$ver/etc/inittab" ]; then
+            cp "$ver/etc/inittab" /mnt/newroot/etc/inittab
+            p "  inittab dari: $pname"
+            break
+        fi
+    done
+fi
+
+# 3. Cari path BootDriver yang benar di GoboLinux 017
+BOOTDRIVER=""
+for bd in \
+    /mnt/newroot/Programs/Scripts/Current/bin/BootDriver \
+    /mnt/newroot/System/Index/bin/BootDriver \
+    /mnt/newroot/sbin/BootDriver; do
+    [ -x "$bd" ] && { BOOTDRIVER="${bd#/mnt/newroot}"; break; }
+done
+[ -z "$BOOTDRIVER" ] && BOOTDRIVER="/Programs/Scripts/Current/bin/BootDriver"
+p "  BootDriver: $BOOTDRIVER"
+
+# 4. Generate inittab jika masih belum ada
+if [ ! -f /mnt/newroot/etc/inittab ]; then
+    p "  Generate inittab..."
+    # Tulis ke file sementara dulu lalu salin (hindari heredoc nested)
+    printf '%s\n' \
+        '# /etc/inittab - GoboLinux 017 Live' \
+        'id:3:initdefault:' \
+        "si::sysinit:$BOOTDRIVER" \
+        "l3:3:wait:$BOOTDRIVER RunLevel03" \
+        'ca::ctrlaltdel:/sbin/shutdown -t3 -r now' \
+        '1:2345:respawn:/sbin/getty 38400 tty1' \
+        '2:23:respawn:/sbin/getty 38400 tty2' \
+        > /mnt/newroot/etc/inittab
+fi
+p "  inittab: $([ -f /mnt/newroot/etc/inittab ] && echo ADA || echo TIDAK)"
+
+# 5. Pastikan /etc/fstab ada
+[ -f /mnt/newroot/etc/fstab ] || printf '%s\n' \
+    'proc  /proc  proc   defaults  0  0' \
+    'sysfs /sys   sysfs  defaults  0  0' \
+    > /mnt/newroot/etc/fstab
+
+# ── Unmount mount points di initramfs sebelum switch_root ────────────────────
+# switch_root akan membuang initramfs dengan menghapus semua file di /
+# Direktori yang masih ter-mount akan gagal di-unlink (warning "Directory not empty")
+# Solusi: lazy unmount semua mount points kecuali yang sudah dipindah ke newroot
+p "cleanup mounts..."
+# Unmount xzm squashfs mounts — setelah overlay dibuat, xzm tidak dibutuhkan lagi
+# Tapi harus hati-hati: jangan umount kalau overlay masih pakai sebagai lowerdir
+# Solusi terbaik: biarkan switch_root handle — warning "failed to unlink" tidak fatal
+# Kernel tidak crash karena ini, hanya pesan warning
+
+# ── switch_root ───────────────────────────────────────────────────────────────
 p "exec switch_root -> $INIT"
 exec switch_root /mnt/newroot "$INIT"
 p "switch_root GAGAL"
