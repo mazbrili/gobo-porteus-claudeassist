@@ -858,9 +858,21 @@ fi
 
 # ── /etc setup ───────────────────────────────────────────────────────────────
 p "setup /etc..."
-mkdir -p /mnt/newroot/etc
 
-# 1. Coba salin dari System/Settings
+# /etc di GoboLinux mungkin symlink ke System/Settings atau tidak ada
+# Perlu direktori NYATA di upper layer overlay agar bisa ditulis
+if [ -L /mnt/newroot/etc ]; then
+    # etc adalah symlink — buat direktori nyata di cow/upper dan bind
+    p "  /etc adalah symlink: $(readlink /mnt/newroot/etc)"
+    mkdir -p /mnt/cow/upper/etc
+    # Mount bind dari upper/etc ke newroot/etc supaya writable
+    mount --bind /mnt/cow/upper/etc /mnt/newroot/etc 2>/dev/null || true
+elif [ ! -d /mnt/newroot/etc ]; then
+    mkdir -p /mnt/newroot/etc
+fi
+p "  /etc type: $([ -L /mnt/newroot/etc ] && echo symlink || echo dir)"
+
+# Salin settings dari System/Settings jika ada
 if [ -d /mnt/newroot/System/Settings ]; then
     for f in /mnt/newroot/System/Settings/*; do
         [ -e "$f" ] || continue
@@ -870,7 +882,7 @@ if [ -d /mnt/newroot/System/Settings ]; then
     done
 fi
 
-# 2. Cari inittab dari Programs/Sysvinit (casenya macam-macam di GoboLinux)
+# Cari inittab dari Programs/Sysvinit
 if [ ! -f /mnt/newroot/etc/inittab ]; then
     for prog_dir in /mnt/newroot/Programs/*/; do
         [ -d "$prog_dir" ] || continue
@@ -883,29 +895,28 @@ if [ ! -f /mnt/newroot/etc/inittab ]; then
         [ -L "$cur" ] || continue
         ver=$(readlink "$cur")
         case "$ver" in /*) ;; *) ver="${prog_dir}${ver}" ;; esac
-        if [ -f "$ver/etc/inittab" ]; then
+        [ -f "$ver/etc/inittab" ] && {
             cp "$ver/etc/inittab" /mnt/newroot/etc/inittab
             p "  inittab dari: $pname"
             break
-        fi
+        }
     done
 fi
 
-# 3. Cari path BootDriver yang benar di GoboLinux 017
-BOOTDRIVER=""
+# Cari BootDriver
+BOOTDRIVER="/Programs/Scripts/Current/bin/BootDriver"
 for bd in \
     /mnt/newroot/Programs/Scripts/Current/bin/BootDriver \
     /mnt/newroot/System/Index/bin/BootDriver \
     /mnt/newroot/sbin/BootDriver; do
     [ -x "$bd" ] && { BOOTDRIVER="${bd#/mnt/newroot}"; break; }
 done
-[ -z "$BOOTDRIVER" ] && BOOTDRIVER="/Programs/Scripts/Current/bin/BootDriver"
 p "  BootDriver: $BOOTDRIVER"
 
-# 4. Generate inittab jika masih belum ada
+# Generate inittab jika belum ada — tulis ke /tmp dulu lalu salin
 if [ ! -f /mnt/newroot/etc/inittab ]; then
     p "  Generate inittab..."
-    # Tulis ke file sementara dulu lalu salin (hindari heredoc nested)
+    ITAB=/tmp/inittab.$$
     printf '%s\n' \
         '# /etc/inittab - GoboLinux 017 Live' \
         'id:3:initdefault:' \
@@ -914,15 +925,24 @@ if [ ! -f /mnt/newroot/etc/inittab ]; then
         'ca::ctrlaltdel:/sbin/shutdown -t3 -r now' \
         '1:2345:respawn:/sbin/getty 38400 tty1' \
         '2:23:respawn:/sbin/getty 38400 tty2' \
-        > /mnt/newroot/etc/inittab
+        > "$ITAB"
+    cp "$ITAB" /mnt/newroot/etc/inittab && rm -f "$ITAB"
 fi
-p "  inittab: $([ -f /mnt/newroot/etc/inittab ] && echo ADA || echo TIDAK)"
 
-# 5. Pastikan /etc/fstab ada
+# Verifikasi — jika masih TIDAK ADA, ada masalah serius dengan /etc
+if [ -f /mnt/newroot/etc/inittab ]; then
+    p "  inittab: ADA ($(cat /mnt/newroot/etc/inittab | wc -l) baris)"
+else
+    p "  inittab: TIDAK ADA — debug /etc:"
+    p "    /etc real path: $(ls -la /mnt/newroot/ | grep ' etc')"
+    p "    /mnt/cow/upper: $(ls /mnt/cow/upper/ 2>/dev/null)"
+fi
+
+# fstab minimal
 [ -f /mnt/newroot/etc/fstab ] || printf '%s\n' \
     'proc  /proc  proc   defaults  0  0' \
     'sysfs /sys   sysfs  defaults  0  0' \
-    > /mnt/newroot/etc/fstab
+    > /mnt/newroot/etc/fstab 2>/dev/null || true
 
 # ── Unmount mount points di initramfs sebelum switch_root ────────────────────
 # switch_root akan membuang initramfs dengan menghapus semua file di /
