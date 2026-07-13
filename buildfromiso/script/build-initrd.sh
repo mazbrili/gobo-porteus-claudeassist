@@ -857,36 +857,28 @@ if [ -z "$INIT" ]; then
 fi
 
 # ── /etc setup ───────────────────────────────────────────────────────────────
+# Tulis langsung ke /mnt/cow/upper/etc/ (writable layer overlay)
+# bypass /mnt/newroot/etc yang mungkin symlink ke squashfs read-only
 p "setup /etc..."
 
-# /etc di GoboLinux mungkin symlink ke System/Settings atau tidak ada
-# Perlu direktori NYATA di upper layer overlay agar bisa ditulis
-if [ -L /mnt/newroot/etc ]; then
-    # etc adalah symlink — buat direktori nyata di cow/upper dan bind
-    p "  /etc adalah symlink: $(readlink /mnt/newroot/etc)"
-    mkdir -p /mnt/cow/upper/etc
-    # Mount bind dari upper/etc ke newroot/etc supaya writable
-    mount --bind /mnt/cow/upper/etc /mnt/newroot/etc 2>/dev/null || true
-elif [ ! -d /mnt/newroot/etc ]; then
-    mkdir -p /mnt/newroot/etc
-fi
-p "  /etc type: $([ -L /mnt/newroot/etc ] && echo symlink || echo dir)"
+# Pastikan etc ada di upper layer (selalu writable)
+mkdir -p /mnt/cow/upper/etc
 
-# Salin settings dari System/Settings jika ada
+# Salin isi dari System/Settings jika ada
 if [ -d /mnt/newroot/System/Settings ]; then
     for f in /mnt/newroot/System/Settings/*; do
-        [ -e "$f" ] || continue
+        [ -f "$f" ] || continue
         fn="${f##*/}"
-        [ -e "/mnt/newroot/etc/$fn" ] || \
-            cp -a "$f" "/mnt/newroot/etc/$fn" 2>/dev/null || true
+        [ -e "/mnt/cow/upper/etc/$fn" ] ||             cp "$f" "/mnt/cow/upper/etc/$fn" 2>/dev/null || true
     done
 fi
 
 # Cari inittab dari Programs/Sysvinit
-if [ ! -f /mnt/newroot/etc/inittab ]; then
+if [ ! -f /mnt/cow/upper/etc/inittab ]; then
     for prog_dir in /mnt/newroot/Programs/*/; do
         [ -d "$prog_dir" ] || continue
-        pname="${prog_dir%/}"; pname="${pname##*/}"
+        pname="${prog_dir%/}"
+        pname="${pname##*/}"
         case "$pname" in
             [Ss]ys[Vv][Ii]nit|[Ss]ysvinit|SYSVINIT) ;;
             *) continue ;;
@@ -894,65 +886,63 @@ if [ ! -f /mnt/newroot/etc/inittab ]; then
         cur="${prog_dir}Current"
         [ -L "$cur" ] || continue
         ver=$(readlink "$cur")
-        case "$ver" in /*) ;; *) ver="${prog_dir}${ver}" ;; esac
-        [ -f "$ver/etc/inittab" ] && {
-            cp "$ver/etc/inittab" /mnt/newroot/etc/inittab
+        case "$ver" in
+            /*) ;;
+            *) ver="${prog_dir}${ver}" ;;
+        esac
+        if [ -f "$ver/etc/inittab" ]; then
+            cp "$ver/etc/inittab" /mnt/cow/upper/etc/inittab
             p "  inittab dari: $pname"
             break
-        }
+        fi
     done
 fi
 
 # Cari BootDriver
 BOOTDRIVER="/Programs/Scripts/Current/bin/BootDriver"
-for bd in \
-    /mnt/newroot/Programs/Scripts/Current/bin/BootDriver \
-    /mnt/newroot/System/Index/bin/BootDriver \
-    /mnt/newroot/sbin/BootDriver; do
-    [ -x "$bd" ] && { BOOTDRIVER="${bd#/mnt/newroot}"; break; }
+for bd in     /mnt/newroot/Programs/Scripts/Current/bin/BootDriver     /mnt/newroot/System/Index/bin/BootDriver     /mnt/newroot/sbin/BootDriver
+do
+    if [ -x "$bd" ]; then
+        BOOTDRIVER="${bd#/mnt/newroot}"
+        break
+    fi
 done
 p "  BootDriver: $BOOTDRIVER"
 
-# Generate inittab jika belum ada — tulis ke /tmp dulu lalu salin
-if [ ! -f /mnt/newroot/etc/inittab ]; then
+# Generate inittab minimal langsung ke upper layer
+if [ ! -f /mnt/cow/upper/etc/inittab ]; then
     p "  Generate inittab..."
-    ITAB=/tmp/inittab.$$
-    printf '%s\n' \
-        '# /etc/inittab - GoboLinux 017 Live' \
-        'id:3:initdefault:' \
-        "si::sysinit:$BOOTDRIVER" \
-        "l3:3:wait:$BOOTDRIVER RunLevel03" \
-        'ca::ctrlaltdel:/sbin/shutdown -t3 -r now' \
-        '1:2345:respawn:/sbin/getty 38400 tty1' \
-        '2:23:respawn:/sbin/getty 38400 tty2' \
-        > "$ITAB"
-    cp "$ITAB" /mnt/newroot/etc/inittab && rm -f "$ITAB"
+    printf '%s\n'         '# /etc/inittab - GoboLinux 017 Live'         'id:3:initdefault:'         "si::sysinit:$BOOTDRIVER"         "l3:3:wait:$BOOTDRIVER RunLevel03"         'ca::ctrlaltdel:/sbin/shutdown -t3 -r now'         '1:2345:respawn:/sbin/getty 38400 tty1'         '2:23:respawn:/sbin/getty 38400 tty2'         > /mnt/cow/upper/etc/inittab
 fi
 
-# Verifikasi — jika masih TIDAK ADA, ada masalah serius dengan /etc
-if [ -f /mnt/newroot/etc/inittab ]; then
-    p "  inittab: ADA ($(cat /mnt/newroot/etc/inittab | wc -l) baris)"
+if [ -f /mnt/cow/upper/etc/inittab ]; then
+    p "  inittab: ADA di upper/etc"
+    # Pastikan /mnt/newroot/etc mengarah ke upper/etc
+    if [ -L /mnt/newroot/etc ]; then
+        # /etc adalah symlink di squashfs — hapus dan buat direktori
+        # (tidak bisa hapus di read-only layer, tapi bisa di upper)
+        mkdir -p /mnt/cow/upper/etc
+        # Buat whiteout entry agar overlay hide symlink
+        # Alternatif: bind mount upper/etc ke /mnt/newroot/etc
+        mount --bind /mnt/cow/upper/etc /mnt/newroot/etc 2>/dev/null || true
+    elif [ ! -d /mnt/newroot/etc ]; then
+        mount --bind /mnt/cow/upper/etc /mnt/newroot/etc 2>/dev/null || true
+    fi
+    # Verifikasi akhir
+    if [ -f /mnt/newroot/etc/inittab ]; then
+        p "  /mnt/newroot/etc/inittab: OK"
+    else
+        p "  WARN: inittab ada di upper tapi tidak terlihat di newroot/etc"
+        p "  Coba bind mount..."
+        mount --bind /mnt/cow/upper/etc /mnt/newroot/etc 2>/dev/null || true
+        [ -f /mnt/newroot/etc/inittab ] && p "  bind mount OK" || p "  bind mount GAGAL"
+    fi
 else
-    p "  inittab: TIDAK ADA — debug /etc:"
-    p "    /etc real path: $(ls -la /mnt/newroot/ | grep ' etc')"
-    p "    /mnt/cow/upper: $(ls /mnt/cow/upper/ 2>/dev/null)"
+    p "  FATAL: gagal tulis inittab ke upper/etc"
 fi
 
 # fstab minimal
-[ -f /mnt/newroot/etc/fstab ] || printf '%s\n' \
-    'proc  /proc  proc   defaults  0  0' \
-    'sysfs /sys   sysfs  defaults  0  0' \
-    > /mnt/newroot/etc/fstab 2>/dev/null || true
-
-# ── Unmount mount points di initramfs sebelum switch_root ────────────────────
-# switch_root akan membuang initramfs dengan menghapus semua file di /
-# Direktori yang masih ter-mount akan gagal di-unlink (warning "Directory not empty")
-# Solusi: lazy unmount semua mount points kecuali yang sudah dipindah ke newroot
-p "cleanup mounts..."
-# Unmount xzm squashfs mounts — setelah overlay dibuat, xzm tidak dibutuhkan lagi
-# Tapi harus hati-hati: jangan umount kalau overlay masih pakai sebagai lowerdir
-# Solusi terbaik: biarkan switch_root handle — warning "failed to unlink" tidak fatal
-# Kernel tidak crash karena ini, hanya pesan warning
+[ -f /mnt/cow/upper/etc/fstab ] || printf '%s\n'     'proc  /proc  proc   defaults  0  0'     'sysfs /sys   sysfs  defaults  0  0'     > /mnt/cow/upper/etc/fstab 2>/dev/null || true
 
 # ── switch_root ───────────────────────────────────────────────────────────────
 p "exec switch_root -> $INIT"
