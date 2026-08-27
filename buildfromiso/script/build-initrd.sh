@@ -873,30 +873,9 @@ if [ -d /mnt/newroot/System/Settings ]; then
     done
 fi
 
-# Cari inittab dari Programs/Sysvinit
-if [ ! -f /mnt/cow/upper/etc/inittab ]; then
-    for prog_dir in /mnt/newroot/Programs/*/; do
-        [ -d "$prog_dir" ] || continue
-        pname="${prog_dir%/}"
-        pname="${pname##*/}"
-        case "$pname" in
-            [Ss]ys[Vv][Ii]nit|[Ss]ysvinit|SYSVINIT) ;;
-            *) continue ;;
-        esac
-        cur="${prog_dir}Current"
-        [ -L "$cur" ] || continue
-        ver=$(readlink "$cur")
-        case "$ver" in
-            /*) ;;
-            *) ver="${prog_dir}${ver}" ;;
-        esac
-        if [ -f "$ver/etc/inittab" ]; then
-            cp "$ver/etc/inittab" /mnt/cow/upper/etc/inittab
-            p "  inittab dari: $pname"
-            break
-        fi
-    done
-fi
+# Tidak ambil inittab dari squashfs — path di dalamnya pakai "Current"
+# yang belum resolve dengan benar saat boot live.
+# Kita akan generate inittab baru dengan path absolut di bawah.
 
 # Cari path BootDriver absolut di Programs/Scripts
 BOOTDRIVER=""
@@ -928,19 +907,19 @@ done
 [ -z "$GETTY_PATH" ] && GETTY_PATH="/sbin/getty"
 p "  getty: $GETTY_PATH"
 
-# Generate inittab dengan path absolut
-if [ ! -f /mnt/cow/upper/etc/inittab ]; then
-    p "  Generate inittab..."
-    {
-        echo '# /etc/inittab - GoboLinux 017 Live'
-        echo 'id:3:initdefault:'
-        echo "si::sysinit:$BOOTDRIVER"
-        echo "l3:3:wait:$BOOTDRIVER RunLevel03"
-        echo 'ca::ctrlaltdel:/sbin/shutdown -t3 -r now'
-        echo "1:2345:respawn:$GETTY_PATH 38400 tty1"
-        echo "2:23:respawn:$GETTY_PATH 38400 tty2"
-    } > /mnt/cow/upper/etc/inittab
-fi
+# SELALU generate inittab baru dengan path absolut ke Programs/
+# Jangan pakai inittab dari squashfs karena pakai "Current" symlink yang belum ada
+p "  Generate inittab (path absolut)..."
+{
+    echo '# /etc/inittab - GoboLinux 017 Live'
+    echo 'id:3:initdefault:'
+    echo "si::sysinit:$BOOTDRIVER"
+    echo "l3:3:wait:$BOOTDRIVER RunLevel03"
+    echo 'ca::ctrlaltdel:/sbin/shutdown -t3 -r now'
+    echo "1:2345:respawn:$GETTY_PATH 38400 tty1"
+    echo "2:23:respawn:$GETTY_PATH 38400 tty2"
+} > /mnt/cow/upper/etc/inittab
+p "  inittab ditulis: $(cat /mnt/cow/upper/etc/inittab | wc -l) baris"
 if [ -f /mnt/cow/upper/etc/inittab ]; then
     p "  inittab: ADA di upper/etc"
     # Pastikan /mnt/newroot/etc mengarah ke upper/etc
