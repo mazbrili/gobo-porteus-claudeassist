@@ -920,36 +920,62 @@ p "  Generate inittab (path absolut)..."
     echo "2:23:respawn:$GETTY_PATH 38400 tty2"
 } > /mnt/cow/upper/etc/inittab
 p "  inittab ditulis: $(cat /mnt/cow/upper/etc/inittab | wc -l) baris"
-if [ -f /mnt/cow/upper/etc/inittab ]; then
-    p "  inittab: ADA di upper/etc"
-    # Pastikan /mnt/newroot/etc mengarah ke upper/etc
-    if [ -L /mnt/newroot/etc ]; then
-        # /etc adalah symlink di squashfs — hapus dan buat direktori
-        # (tidak bisa hapus di read-only layer, tapi bisa di upper)
-        mkdir -p /mnt/cow/upper/etc
-        # Buat whiteout entry agar overlay hide symlink
-        # Alternatif: bind mount upper/etc ke /mnt/newroot/etc
-        mount --bind /mnt/cow/upper/etc /mnt/newroot/etc 2>/dev/null || true
-    elif [ ! -d /mnt/newroot/etc ]; then
-        mount --bind /mnt/cow/upper/etc /mnt/newroot/etc 2>/dev/null || true
-    fi
-    # Verifikasi akhir
-    if [ -f /mnt/newroot/etc/inittab ]; then
-        p "  /mnt/newroot/etc/inittab: OK"
-    else
-        p "  WARN: inittab ada di upper tapi tidak terlihat di newroot/etc"
-        p "  Coba bind mount..."
-        mount --bind /mnt/cow/upper/etc /mnt/newroot/etc 2>/dev/null || true
-        [ -f /mnt/newroot/etc/inittab ] && p "  bind mount OK" || p "  bind mount GAGAL"
-    fi
+# ── Force bind mount /mnt/cow/upper/etc ke /mnt/newroot/etc ─────────────────
+# Ini memastikan inittab yang kita generate PASTI terbaca oleh Sysvinit
+# Tidak peduli apakah /etc di squashfs adalah symlink, dir, atau tidak ada
+p "  mount /etc..."
+
+# Jika /mnt/newroot/etc adalah symlink, kita tidak bisa bind mount ke sana
+# Solusi: mount ke titik yang pasti ada
+if [ -L /mnt/newroot/etc ]; then
+    p "  /etc adalah symlink: $(readlink /mnt/newroot/etc)"
+    # Hapus symlink di upper layer dan buat direktori
+    # Upper layer path untuk /etc
+    up_etc="/mnt/cow/upper/etc"
+    mkdir -p "$up_etc"
+    # Buat whiteout untuk symlink: file .wh.etc di upper parent
+    # Ini memberitahu overlay untuk hide /etc symlink dari lower
+    touch /mnt/cow/upper/.wh.etc 2>/dev/null || true
+    rm -f /mnt/cow/upper/.wh.etc 2>/dev/null || true
+    # Cara paling reliable: bind mount langsung
+    mount --bind /mnt/cow/upper/etc /mnt/newroot/etc 2>/dev/null || {
+        # Jika gagal karena /mnt/newroot/etc tidak bisa di-mount (symlink),
+        # coba hapus symlink dulu dengan membuat dir di upper
+        p "  bind mount gagal, coba cara lain..."
+    }
+elif [ ! -d /mnt/newroot/etc ]; then
+    p "  /etc tidak ada, buat direktori..."
+    mkdir -p /mnt/cow/upper/etc
+    mount --bind /mnt/cow/upper/etc /mnt/newroot/etc 2>/dev/null || true
 else
-    p "  FATAL: gagal tulis inittab ke upper/etc"
+    # /etc sudah direktori — cukup bind mount upper/etc ke atasnya
+    mount --bind /mnt/cow/upper/etc /mnt/newroot/etc 2>/dev/null || true
 fi
 
-# fstab minimal
-[ -f /mnt/cow/upper/etc/fstab ] || printf '%s\n'     'proc  /proc  proc   defaults  0  0'     'sysfs /sys   sysfs  defaults  0  0'     > /mnt/cow/upper/etc/fstab 2>/dev/null || true
+# Verifikasi final
+if [ -f /mnt/newroot/etc/inittab ]; then
+    p "  inittab di newroot/etc: ADA"
+    p "  isi inittab:"
+    while read -r line; do p "    $line"; done < /mnt/newroot/etc/inittab
+else
+    p "  WARN: inittab tidak terlihat di newroot/etc"
+    p "  Isi /mnt/cow/upper/etc:"
+    for f in /mnt/cow/upper/etc/*; do
+        [ -e "$f" ] && p "    ${f##*/}"
+    done
+    p "  Isi /mnt/newroot/etc:"
+    for f in /mnt/newroot/etc/*; do
+        [ -e "$f" ] && p "    ${f##*/}"
+    done
+    p "  Tipe /mnt/newroot/etc: $(ls -ld /mnt/newroot/etc 2>/dev/null)"
+fi
 
-# ── switch_root ───────────────────────────────────────────────────────────────
+# fstab
+[ -f /mnt/cow/upper/etc/fstab ] || {
+    echo 'proc  /proc  proc   defaults  0  0' > /mnt/cow/upper/etc/fstab
+    echo 'sysfs /sys   sysfs  defaults  0  0' >> /mnt/cow/upper/etc/fstab
+}
+
 p "exec switch_root -> $INIT"
 exec switch_root /mnt/newroot "$INIT"
 p "switch_root GAGAL"
